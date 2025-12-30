@@ -964,7 +964,7 @@ func (s *serverAccount) BlockAccount(ctx context.Context, in *pb.BlockAccountReq
 		}
 		allowAcct := strings.Join(acctList, ",")
 		for _, v := range partitions {
-			getconfacctcmd := fmt.Sprintf("grep %s -r %s/etc/|awk '{ for(i=1; i<=NF; i++) if(tolower($i) ~ /allowaccounts/) print $i }'|awk -F= '{print $NF}'", v, slurmpath)
+			getconfacctcmd := fmt.Sprintf("grep %s -r %s/etc/ 2>/dev/null |awk '{ for(i=1; i<=NF; i++) if(tolower($i) ~ /allowaccounts/) print $i }'|awk -F= '{print $NF}'", v, slurmpath)
 			confacct := string("")
 			confacct, err = utils.RunCommand(getconfacctcmd)
 			if err != nil {
