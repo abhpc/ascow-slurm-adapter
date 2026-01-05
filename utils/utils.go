@@ -380,6 +380,19 @@ func LocalSubmitJob(scriptString string, username string) (string, error) {
 	return output.String(), nil
 }
 
+func ExtractValue(input, key string) string {
+	// 构建匹配键值对的正则表达式
+	pattern := fmt.Sprintf("%s=([^\\s]+)", key)
+	re := regexp.MustCompile(pattern)
+
+	// 查找第一个匹配项
+	match := re.FindStringSubmatch(input)
+	if len(match) >= 2 {
+		return match[1]
+	}
+	return ""
+}
+
 func LocalFileSubmitJob(filePath string, username string) (string, error) {
 	config := ParseConfig(DefaultConfigPath)
 	slurmpath := config.Slurm.Slurmpath

@@ -1,6 +1,7 @@
 package main
 
 import (
+  "bufio"
 	"context"
 	"database/sql"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+ 	"sync"
 
 	pb "scow-slurm-adapter/gen/go"
 
@@ -2338,6 +2340,161 @@ func (s *serverConfig) GetClusterInfo(ctx context.Context, in *pb.GetClusterInfo
 		}
 	}
 	return &pb.GetClusterInfoResponse{ClusterName: clusterName, Partitions: parts}, nil
+}
+
+func extractNodeInfo(info string) *pb.NodeInfo {
+	var (
+		partitionList []string
+		totalGpusInt  int
+		allocGpusInt  int
+		nodeState     pb.NodeInfo_NodeState
+	)
+
+	nodeName := utils.ExtractValue(info, "NodeName")
+	partitions := utils.ExtractValue(info, "Partitions")
+	partitionList = append(partitionList, strings.Split(partitions, ",")...)
+	state := utils.ExtractValue(info, "State") // 这个地方要改
+	switch state {
+	case "IDLE", "IDLE+PLANNED":
+		nodeState = pb.NodeInfo_IDLE
+	case "DOWN", "DOWN+NOT_RESPONDING", "ALLOCATED+DRAIN", "IDLE+DRAIN", "IDLE+DRAIN+NOT_RESPONDING", "DOWN+DRAIN+INVALID_REG", "IDLE+NOT_RESPONDING":
+		nodeState = pb.NodeInfo_NOT_AVAILABLE
+	case "ALLOCATED", "MIXED":
+		nodeState = pb.NodeInfo_RUNNING
+	default: // 其他不知道的状态默认为不可用的状态
+		nodeState = pb.NodeInfo_NOT_AVAILABLE
+	}
+	totalMem := utils.ExtractValue(info, "RealMemory")
+	totalMemInt, _ := strconv.Atoi(totalMem)
+	AllocMem := utils.ExtractValue(info, "AllocMem")
+	AllocMemInt, _ := strconv.Atoi(AllocMem)
+	totalCpuCores := utils.ExtractValue(info, "CPUTot")
+	totalCpuCoresInt, _ := strconv.Atoi(totalCpuCores)
+	allocCpuCores := utils.ExtractValue(info, "CPUAlloc")
+	allocCpuCoresInt, _ := strconv.Atoi(allocCpuCores)
+	totalGpus := utils.ExtractValue(info, "Gres")
+	if totalGpus == "(null)" {
+		totalGpusInt = 0
+	} else {
+		totalGpusStrWithBrace := strings.Split(totalGpus, ":")[1]
+		totalGpusStr := strings.Split(totalGpusStrWithBrace, "(")[0]
+		totalGpusInt, _ = strconv.Atoi(totalGpusStr)
+	}
+	allocGpus := utils.ExtractValue(info, "AllocTRES")
+	if allocGpus == "" {
+		allocGpusInt = 0
+	} else {
+		if strings.Contains(allocGpus, "gpu") {
+			allocRes := strings.Split(allocGpus, ",")
+			for _, res := range allocRes {
+				if strings.Contains(res, "gpu") {
+					gpuAllocResStr := strings.Split(res, "=")[1]
+					allocGpusInt, _ = strconv.Atoi(gpuAllocResStr)
+					break
+				}
+			}
+		} else {
+			allocGpusInt = 0
+		}
+	}
+
+	return &pb.NodeInfo{
+		NodeName:          nodeName,
+		Partitions:        partitionList,
+		State:             nodeState,
+		CpuCoreCount:      uint32(totalCpuCoresInt),
+		AllocCpuCoreCount: uint32(allocCpuCoresInt),
+		IdleCpuCoreCount:  uint32(totalCpuCoresInt) - uint32(allocCpuCoresInt),
+		TotalMemMb:        uint32(totalMemInt),
+		AllocMemMb:        uint32(AllocMemInt),
+		IdleMemMb:         uint32(totalMemInt) - uint32(AllocMemInt),
+		GpuCount:          uint32(totalGpusInt),
+		AllocGpuCount:     uint32(allocGpusInt),
+		IdleGpuCount:      uint32(totalGpusInt) - uint32(allocGpusInt),
+	}
+}
+
+func getNodeInfo(node string, wg *sync.WaitGroup, nodeChan chan<- *pb.NodeInfo, errChan chan<- error) {
+	defer wg.Done()
+
+	getNodeInfoCmd := fmt.Sprintf("scontrol show nodes %s --oneliner", node)
+	info, err := utils.RunCommand(getNodeInfoCmd)
+	if err != nil {
+		errInfo := &errdetails.ErrorInfo{
+			Reason: "COMMAND_EXEC_FAILED",
+		}
+		st := status.New(codes.Internal, "Exec command failed or slurmctld down.")
+		st, _ = st.WithDetails(errInfo)
+		errChan <- st.Err()
+		return
+	}
+
+	nodeInfo := extractNodeInfo(info)
+
+	nodeChan <- nodeInfo
+}
+
+func (s *serverConfig) GetClusterNodesInfo(ctx context.Context, in *pb.GetClusterNodesInfoRequest) (*pb.GetClusterNodesInfoResponse, error) {
+	var (
+		wg        sync.WaitGroup
+		nodesInfo []*pb.NodeInfo
+	)
+	logger.Infof("Received request GetClusterNodesInfo: %v", in)
+	nodeChan := make(chan *pb.NodeInfo, len(in.NodeNames))
+	errChan := make(chan error, len(in.NodeNames))
+
+	if len(in.NodeNames) == 0 {
+		// 获取集群中全部节点的信息
+		getNodesInfoCmd := "scontrol show nodes --oneliner | grep Partitions" // 获取全部计算节点主机名
+		output, err := utils.RunCommand(getNodesInfoCmd)
+		if err != nil {
+			errInfo := &errdetails.ErrorInfo{
+				Reason: "COMMAND_EXEC_FAILED",
+			}
+			st := status.New(codes.Internal, "Exec command failed or slurmctld down.")
+			st, _ = st.WithDetails(errInfo)
+			logger.Errorf("GetClusterNodesInfo failed: %v", st.Err())
+			return nil, st.Err()
+		}
+		// 按行分割输出
+		scanner := bufio.NewScanner(strings.NewReader(output))
+		for scanner.Scan() {
+			line := scanner.Text()
+			nodeInfo := extractNodeInfo(line)
+			nodesInfo = append(nodesInfo, nodeInfo)
+		}
+		logger.Tracef("GetClusterNodesInfoResponse: %v", nodesInfo)
+		return &pb.GetClusterNodesInfoResponse{Nodes: nodesInfo}, nil
+	}
+
+	for _, node := range in.NodeNames {
+		nodeName := node
+		wg.Add(1)
+		go func() {
+			getNodeInfo(nodeName, &wg, chan<- *pb.NodeInfo(nodeChan), chan<- error(errChan))
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(nodeChan)
+		close(errChan)
+	}()
+
+	for nodeInfo := range nodeChan {
+		nodesInfo = append(nodesInfo, nodeInfo)
+	}
+
+	select {
+	case err := <-errChan:
+		if err != nil {
+			logger.Errorf("GetClusterNodesInfo failed: %v", err)
+			return nil, err
+		}
+	default:
+	}
+	logger.Tracef("GetClusterNodesInfoResponse: %v", nodesInfo)
+	return &pb.GetClusterNodesInfoResponse{Nodes: nodesInfo}, nil
 }
 
 // job service
