@@ -1004,7 +1004,7 @@ func (s *serverAccount) BlockAccount(ctx context.Context, in *pb.BlockAccountReq
 	// 账户存在AllowAcctList中，则删除账户后更新计算分区AllowAccounts
 	updateAllowAcct := utils.DeleteSlice(AllowAcctList, in.AccountName)
 	for _, p := range partitions {
-		getconfacctcmd := fmt.Sprintf("grep %s -r %s/etc/|awk '{ for(i=1; i<=NF; i++) if(tolower($i) ~ /allowaccounts/) print $i }'|awk -F= '{print $NF}'", p, slurmpath)
+		getconfacctcmd := fmt.Sprintf("grep %s -r %s/etc/ 2>/dev/null|awk '{ for(i=1; i<=NF; i++) if(tolower($i) ~ /allowaccounts/) print $i }'|awk -F= '{print $NF}'", p, slurmpath)
 		//getconfacctcmd := fmt.Sprintf("grep -i AllowAccounts -r $(dirname $(scontrol show conf | grep SLURM_CONF | awk '{print $NF}'))|grep -v '^#'| grep %s | awk -F AllowAccounts= '{print $2}' | awk '{print $1}'", p)
 		confacct := string("")
 		confacct, err = utils.RunCommand(getconfacctcmd)
