@@ -1,7 +1,7 @@
 package main
 
 import (
-  "bufio"
+	"bufio"
 	"context"
 	"database/sql"
 	"io"
@@ -16,8 +16,8 @@ import (
 	"scow-slurm-adapter/utils"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
- 	"sync"
 
 	pb "scow-slurm-adapter/gen/go"
 
@@ -2951,6 +2951,202 @@ func (s *serverJob) GetJobType(ctx context.Context, in *pb.GetJobTypeRequest) (*
 	}
 	jobType = strings.Split(jobTypeString, " ")[2]
 	return &pb.GetJobTypeResponse{JobType: jobType}, nil
+}
+
+func (s *serverJob) GetRecentlyJobPaths(ctx context.Context, in *pb.GetRecentlyJobPathsRequest) (*pb.GetRecentlyJobPathsResponse, error) {
+	var (
+		workingDirectories []string
+		jobId              int
+		workingDirectory   string
+		submitTime         int64
+		idUser             int
+		userName           string
+	)
+
+	// 记录日志
+	logger.Infof("Received request GetRecentlyJobPaths for user: %s", in.User)
+
+	// 获取集群名称
+	clusterName := configValue.MySQLConfig.ClusterName
+
+	// 验证用户参数
+	if in.User == "" {
+		errInfo := &errdetails.ErrorInfo{
+			Reason: "INVALID_USER_PARAMETER",
+		}
+		st := status.New(codes.InvalidArgument, "user parameter is empty")
+		st, _ = st.WithDetails(errInfo)
+		return nil, st.Err()
+	}
+
+	// 首先获取用户的UID（与GetJobs中的逻辑保持一致）
+	uid, _, err := utils.GetUserUidGid(in.User)
+	if err != nil {
+		logger.Warnf("GetRecentlyJobPaths: failed to get UID for user %s: %v", in.User, err)
+		// 如果无法获取UID，尝试直接使用用户名查询
+		userName = in.User
+	} else {
+		idUser = uid
+		userName = in.User
+	}
+
+	// 构建查询SQL，获取指定用户的最新10条作业的working directory
+	// 使用与GetJobs相同的查询逻辑，按时间降序排列
+	var querySQL string
+	var queryParams []interface{}
+
+	if idUser > 0 {
+		// 使用UID查询（更准确）
+		querySQL = fmt.Sprintf(`
+            SELECT jt.id_job, 
+				CONVERT(CONVERT(CONVERT(jt.work_dir USING latin1)USING binary)USING utf8mb4) AS work_dir,
+				jt.time_submit 
+            FROM %s_job_table jt
+            WHERE jt.id_user = ?
+            AND jt.work_dir IS NOT NULL 
+            AND jt.work_dir != ''
+            ORDER BY jt.time_submit DESC, jt.id_job DESC 
+            LIMIT 10
+        `, clusterName)
+		queryParams = []interface{}{idUser}
+	} else {
+		// 使用用户名查询（备选方案）
+		querySQL = fmt.Sprintf(`
+            SELECT jt.id_job, 
+				CONVERT(CONVERT(CONVERT(jt.work_dir USING latin1)USING binary)USING utf8mb4) AS work_dir, 
+				jt.time_submit 
+            FROM %s_job_table jt
+            JOIN %s_user_table ut ON jt.id_user = ut.id_user
+            WHERE ut.user_name = ?
+            AND jt.work_dir IS NOT NULL 
+            AND jt.work_dir != ''
+            ORDER BY jt.time_submit DESC, jt.id_job DESC 
+            LIMIT 10
+        `, clusterName, clusterName)
+		queryParams = []interface{}{userName}
+	}
+
+	rows, err := db.Query(querySQL, queryParams...)
+	if err != nil {
+		logger.Errorf("GetRecentlyJobPaths: failed to query database: %v", err)
+		// 数据库查询失败时，尝试从squeue获取运行中的作业（与GetJobs逻辑类似）
+		return s.getRunningJobsWorkingDirectories(in.User)
+	}
+	defer rows.Close()
+
+	// 处理查询结果
+	for rows.Next() {
+		if err := rows.Scan(&jobId, &workingDirectory, &submitTime); err != nil {
+			logger.Errorf("GetRecentlyJobPaths: failed to scan row: %v", err)
+			continue
+		}
+
+		// 确保workingDirectory不为空
+		if workingDirectory != "" && workingDirectory != "(null)" {
+			workingDirectories = append(workingDirectories, workingDirectory)
+			logger.Debugf("GetRecentlyJobPaths: found job %d with work_dir: %s, submit_time: %d",
+				jobId, workingDirectory, submitTime)
+		}
+	}
+
+	// 检查遍历过程中是否有错误
+	if err := rows.Err(); err != nil {
+		logger.Errorf("GetRecentlyJobPaths: error iterating rows: %v", err)
+	}
+
+	// 如果数据库中没有找到记录，或者记录少于10条，尝试从squeue获取运行中的作业
+	if len(workingDirectories) < 10 {
+		logger.Infof("GetRecentlyJobPaths: only found %d jobs in database for user %s, trying squeue",
+			len(workingDirectories), in.User)
+
+		squeueDirectories := s.getSqueueWorkingDirectories(in.User, 10-len(workingDirectories))
+		for _, dir := range squeueDirectories {
+			if !contains(workingDirectories, dir) {
+				workingDirectories = append(workingDirectories, dir)
+			}
+		}
+	}
+
+	// 限制最多返回10条（按时间顺序）
+	if len(workingDirectories) > 10 {
+		workingDirectories = workingDirectories[:10]
+	}
+
+	logger.Infof("GetRecentlyJobPaths: returning %d working directories for user %s",
+		len(workingDirectories), in.User)
+
+	return &pb.GetRecentlyJobPathsResponse{
+		WorkingDirectory: workingDirectories,
+	}, nil
+}
+
+// getRunningJobsWorkingDirectories 当数据库查询失败时，从squeue获取作业的工作目录
+func (s *serverJob) getRunningJobsWorkingDirectories(user string) (*pb.GetRecentlyJobPathsResponse, error) {
+	workingDirectories := s.getSqueueWorkingDirectories(user, 10)
+
+	logger.Infof("getRunningJobsWorkingDirectories: returning %d working directories for user %s",
+		len(workingDirectories), user)
+
+	return &pb.GetRecentlyJobPathsResponse{
+		WorkingDirectory: workingDirectories,
+	}, nil
+}
+
+// getSqueueWorkingDirectories 从squeue获取指定用户作业的工作目录
+func (s *serverJob) getSqueueWorkingDirectories(user string, limit int) []string {
+	var workingDirectories []string
+
+	// 构建squeue命令获取运行中的作业（包括RUNNING、PENDING、SUSPENDED状态）
+	// 使用与GetJobs相同的格式
+	squeueCmd := fmt.Sprintf("squeue -u %s --noheader --format='%%Z' | head -%d", user, limit)
+	squeueResult, err := utils.RunCommand(squeueCmd)
+
+	if err != nil {
+		logger.Warnf("getSqueueWorkingDirectories: failed to run squeue command: %v", err)
+		return workingDirectories
+	}
+
+	if utils.CheckSlurmStatus(squeueResult) {
+		logger.Warnf("getSqueueWorkingDirectories: slurmctld may be down")
+		return workingDirectories
+	}
+
+	// 处理squeue结果
+	lines := strings.Split(strings.TrimSpace(squeueResult), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && line != "(null)" {
+			workingDirectories = append(workingDirectories, line)
+		}
+	}
+
+	// 如果没有获取到运行中的作业，尝试获取所有状态的作业
+	if len(workingDirectories) == 0 {
+		squeueAllCmd := fmt.Sprintf("squeue -u %s --states=all --noheader --format='%%Z' | head -%d", user, limit)
+		squeueAllResult, err := utils.RunCommand(squeueAllCmd)
+
+		if err == nil && !utils.CheckSlurmStatus(squeueAllResult) {
+			allLines := strings.Split(strings.TrimSpace(squeueAllResult), "\n")
+			for _, line := range allLines {
+				line = strings.TrimSpace(line)
+				if line != "" && line != "(null)" {
+					workingDirectories = append(workingDirectories, line)
+				}
+			}
+		}
+	}
+
+	return workingDirectories
+}
+
+// contains 检查字符串是否在切片中
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *serverJob) GetJobs(ctx context.Context, in *pb.GetJobsRequest) (*pb.GetJobsResponse, error) {
