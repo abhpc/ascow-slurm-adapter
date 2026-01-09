@@ -1,6 +1,6 @@
-# ABHPC slurm adapter for openSCOW <!-- omit in toc -->
+# Slurm adapter for ASCOW/ASCOW Pro <!-- omit in toc -->
 
-适用于ABHPC系统的SCOW适配器。
+适用于ASCOW和ASCOW Pro系统的Slurm适配器。
 
 - [1 功能更新](#1-功能更新)
 - [2 安装](#2-安装)
