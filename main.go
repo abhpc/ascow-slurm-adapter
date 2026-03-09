@@ -681,6 +681,94 @@ func (s *serverUser) QueryUserInAccountBlockStatus(ctx context.Context, in *pb.Q
 	return &pb.QueryUserInAccountBlockStatusResponse{Blocked: true}, nil
 }
 
+func (s *serverUser) DeleteUser(ctx context.Context, in *pb.DeleteUserRequest) (*pb.DeleteUserResponse, error) {
+	// 检查用户是不是存在
+	var (
+		userName string
+	)
+	userSqlConfig := "SELECT name FROM user_table WHERE name = ? AND deleted = 0"
+	err := db.QueryRow(userSqlConfig, in.UserId).Scan(&userName)
+	if err != nil {
+		errInfo := &errdetails.ErrorInfo{
+			Reason: "USER_NOT_FOUND",
+		}
+		message := fmt.Sprintf("%s does not exists.", in.UserId)
+		st := status.New(codes.NotFound, message)
+		st, _ = st.WithDetails(errInfo)
+		logger.Warnf("DeleteUser failed: %v", st.Err())
+		// return nil, st.Err()
+	}
+
+	// 作业的判断
+	userRunningJobInfoCmd := fmt.Sprintf("squeue --noheader -u %s", in.UserId)
+	runningJobInfo, err := utils.RunCommand(userRunningJobInfoCmd)
+
+	if err != nil {
+		errInfo := &errdetails.ErrorInfo{
+			Reason: "CMD_EXECUTE_FAILED",
+		}
+		st := status.New(codes.NotFound, err.Error())
+		st, _ = st.WithDetails(errInfo)
+		logger.Warnf("DeleteUser failed: %v", st.Err())
+		// return nil, st.Err()
+	}
+
+	if len(runningJobInfo) > 0 {
+		cancelJobCmd := fmt.Sprintf("scancel -u %s", in.UserId)
+		_, err := utils.RunCommand(cancelJobCmd)
+		if err != nil {
+			errInfo := &errdetails.ErrorInfo{
+				Reason: "CMD_EXECUTE_FAILED",
+			}
+			st := status.New(codes.NotFound, err.Error())
+			st, _ = st.WithDetails(errInfo)
+			logger.Warnf("DeleteUser failed: %v", st.Err())
+			// return nil, st.Err()
+		}
+	}
+
+	deleteUserCmd := fmt.Sprintf("sacctmgr -i delete user name=%s", in.UserId)
+	_, err = utils.RunCommand(deleteUserCmd)
+	if err != nil {
+		errInfo := &errdetails.ErrorInfo{
+			Reason: "CMD_EXECUTE_FAILED",
+		}
+		st := status.New(codes.NotFound, err.Error())
+		st, _ = st.WithDetails(errInfo)
+		logger.Warnf("DeleteUser failed: %v", st.Err())
+		// return nil, st.Err()
+	}
+
+	logger.Infof("DeleteHomeDir: %t", in.DeleteHomeDir)
+	if in.DeleteHomeDir {
+		// 获取用户家目录
+		getHomeDirCmd := fmt.Sprintf("eval echo ~%s", in.UserId)
+		homeDir, err := utils.RunCommand(getHomeDirCmd)
+		if err != nil {
+			// 如果获取家目录失败，记录日志但不中断流程
+			logger.Warnf("Failed to get home directory for user %s: %v", in.UserId, err)
+		} else if homeDir != "" {
+			// 清理可能存在的换行符
+			homeDir = strings.TrimSpace(homeDir)
+
+			deleteHomeDirCmd := fmt.Sprintf("rm -rf %s", homeDir)
+			_, err = utils.RunCommand(deleteHomeDirCmd)
+			if err != nil {
+				logger.Warnf("Failed to delete home directory %s for user %s: %v",
+					homeDir, in.UserId, err)
+				// 这里只是警告，不返回错误，因为用户已经从slurm删除了
+			} else {
+				logger.Infof("Deleted home directory: %s for user: %s", homeDir, in.UserId)
+			}
+		}
+	}
+	logger.Infof("Delete User: %v sucess!", in.UserId)
+	// 执行成功直接返回
+
+	return &pb.DeleteUserResponse{}, nil
+
+}
+
 // Account service
 func (s *serverAccount) ListAccounts(ctx context.Context, in *pb.ListAccountsRequest) (*pb.ListAccountsResponse, error) {
 	var (
@@ -1325,6 +1413,103 @@ func (s *serverAccount) QueryAccountBlockStatus(ctx context.Context, in *pb.Quer
 		return &pb.QueryAccountBlockStatusResponse{Blocked: true}, nil
 	}
 	return &pb.QueryAccountBlockStatusResponse{Blocked: false}, nil
+}
+
+func (s *serverAccount) DeleteAccount(ctx context.Context, in *pb.DeleteAccountRequest) (*pb.DeleteAccountResponse, error) {
+	var (
+		acctName string
+	)
+	// 检查账户名是否在slurm中
+	acctSqlConfig := "SELECT name FROM acct_table WHERE name = ? AND deleted = 0"
+	err := db.QueryRow(acctSqlConfig, in.AccountName).Scan(&acctName)
+	if err != nil {
+		errInfo := &errdetails.ErrorInfo{
+			Reason: "ACCOUNT_NOT_FOUND",
+		}
+		message := fmt.Sprintf("%s does not exists.", in.AccountName)
+		st := status.New(codes.NotFound, message)
+		st, _ = st.WithDetails(errInfo)
+		logger.Errorf("DeleteAccount failed: %v", st.Err())
+		return nil, st.Err()
+	}
+	// 作业的判断
+	accountRunningJobInfoCmd := fmt.Sprintf("squeue --noheader -A %s", in.AccountName)
+	runningJobInfo, err := utils.RunCommand(accountRunningJobInfoCmd)
+	if err != nil {
+		errInfo := &errdetails.ErrorInfo{
+			Reason: "CMD_EXECUTE_FAILED",
+		}
+		st := status.New(codes.NotFound, err.Error())
+		st, _ = st.WithDetails(errInfo)
+		logger.Errorf("DeleteAccount failed: %v", st.Err())
+		return nil, st.Err()
+	}
+	if len(runningJobInfo) == 0 {
+		// 可以删，先删除关联用户
+		getUsersCmd := fmt.Sprintf("sacctmgr list assoc format=\"User\" account=%s -n", in.AccountName)
+		usersOutput, err := utils.RunCommand(getUsersCmd)
+		if err != nil {
+			errInfo := &errdetails.ErrorInfo{
+				Reason: "CMD_EXECUTE_FAILED",
+			}
+			st := status.New(codes.Internal, fmt.Sprintf("Failed to get users for account: %v", err))
+			st, _ = st.WithDetails(errInfo)
+			logger.Errorf("DeleteAccount failed to get users: %v", st.Err())
+			return nil, st.Err()
+		}
+
+		// 删除每个与账户关联的用户
+		if len(usersOutput) > 0 {
+			// 解析用户列表
+			lines := strings.Split(strings.TrimSpace(usersOutput), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				// 使用awk提取第一个字段
+				fields := strings.Fields(line)
+				if len(fields) == 0 {
+					continue
+				}
+				user := fields[0]
+
+				// 删除用户与账户的关联
+				deleteUserCmd := fmt.Sprintf("sacctmgr -i delete user %s account=%s", user, in.AccountName)
+				_, err := utils.RunCommand(deleteUserCmd)
+				if err != nil {
+					// 注意：这里可能希望继续删除其他用户，即使某个用户删除失败
+					logger.Warningf("Failed to delete user %s from account %s: %v", user, in.AccountName, err)
+				} else {
+					logger.Infof("Successfully deleted user %s from account %s", user, in.AccountName)
+				}
+			}
+		}
+
+		// 具体的删除操作
+		deleteAccountCmd := fmt.Sprintf("sacctmgr -i delete account name=%s", in.AccountName)
+		_, err = utils.RunCommand(deleteAccountCmd)
+		if err != nil {
+			// 删除失败
+			errInfo := &errdetails.ErrorInfo{
+				Reason: "CMD_EXECUTE_FAILED",
+			}
+			st := status.New(codes.NotFound, err.Error())
+			st, _ = st.WithDetails(errInfo)
+			logger.Errorf("DeleteAccount failed: %v", st.Err())
+			return nil, st.Err()
+		}
+		return &pb.DeleteAccountResponse{}, nil
+	} else {
+		// 不能删
+		errInfo := &errdetails.ErrorInfo{
+			Reason: "HAVE_RUNNING_JOBS",
+		}
+		st := status.New(codes.NotFound, "Exist running jobs.")
+		st, _ = st.WithDetails(errInfo)
+		logger.Errorf("DeleteAccount failed: %v", st.Err())
+		return nil, st.Err()
+	}
 }
 
 // config service
