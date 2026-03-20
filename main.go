@@ -1479,7 +1479,14 @@ func (s *serverAccount) DeleteAccount(ctx context.Context, in *pb.DeleteAccountR
 				_, err := utils.RunCommand(deleteUserCmd)
 				if err != nil {
 					// 注意：这里可能希望继续删除其他用户，即使某个用户删除失败
-					logger.Warningf("Failed to delete user %s from account %s: %v", user, in.AccountName, err)
+					logger.Warningf("Failed to delete user %s from account %s: %v. Try delete by defaultaccount", user, in.AccountName, err)
+					deleteUserCmd := fmt.Sprintf("sacctmgr -i delete user %s defaultaccount=%s", user, in.AccountName)
+					_, err := utils.RunCommand(deleteUserCmd)
+					if err != nil {
+						logger.Errorf("Failed to delete user %s from defaultaccount %s: %v", user, in.AccountName, err)
+					} else {
+						logger.Infof("Successfully deleted user %s from account %s", user, in.AccountName)
+					}
 				} else {
 					logger.Infof("Successfully deleted user %s from account %s", user, in.AccountName)
 				}
