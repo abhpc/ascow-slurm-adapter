@@ -954,11 +954,8 @@ func (s *serverAccount) CreateAccount(ctx context.Context, in *pb.CreateAccountR
 
 func (s *serverAccount) BlockAccount(ctx context.Context, in *pb.BlockAccountRequest) (*pb.BlockAccountResponse, error) {
 	var (
-		acctName      string
-		assocAcctName string
-		acctList      []string
+		acctName string
 	)
-	slurmpath := utils.GetSlurmPath()
 	// 记录日志
 	logger.Infof("Received request BlockAccount: %v", in)
 	// 检查账户名中是否包含大写字母
@@ -1006,23 +1003,33 @@ func (s *serverAccount) BlockAccount(ctx context.Context, in *pb.BlockAccountReq
 		st, _ = st.WithDetails(errInfo)
 		return nil, st.Err()
 	}
-	// 获取计算分区AllowAccounts的值
-	getAllowAcctCmd := fmt.Sprintf("scontrol show partition %s | grep AllowAccounts | awk '{print $2}' | awk -F '=' '{print $2}'", partitions[0])
-	// getAllowAcctCmd := fmt.Sprintf("scontrol show partition %s | grep AllowAccounts | awk '{print $2}' | awk -F '=' '{print $2}'", "compute")
-
-	output, err := utils.RunCommand(getAllowAcctCmd)
-	if err != nil || utils.CheckSlurmStatus(output) {
+	// 解析 slurm.conf（含 include 文件）获取各分区显式定义的 AllowAccounts。
+	// 返回的 map 中只包含非 ALL 的固定值；不在 map 中的分区表示 AllowAccounts=ALL
+	// 或未设置，将在下方循环中按运行时值动态处理。
+	// 若解析失败则打印警告并使用空 map，不中断封禁主流程。
+	confAllowMap, confErr := utils.GetPartitionAllowAccountsFromConf()
+	if confErr != nil {
+		logger.Warnf("BlockAccount: failed to parse slurm.conf AllowAccounts: %v", confErr)
+		confAllowMap = map[string]string{}
+	}
+	// 预查询 Slurm DB 中除被封账户外的所有账户列表。
+	// 当某分区 AllowAccounts=ALL 时，封禁操作需要将其改为"全部账户减去被封账户"
+	// 的显式列表，此处提前查好，避免在分区循环中重复查询。
+	allAcctSqlConfig := fmt.Sprintf("SELECT DISTINCT acct FROM %s_assoc_table WHERE deleted = 0 AND acct != ?", clusterName)
+	allRows, err := db.Query(allAcctSqlConfig, in.AccountName)
+	if err != nil {
 		errInfo := &errdetails.ErrorInfo{
-			Reason: "COMMAND_EXEC_FAILED",
+			Reason: "SQL_QUERY_FAILED",
 		}
-		st := status.New(codes.Internal, "Exec command failed or slurmctld down.")
+		st := status.New(codes.Internal, err.Error())
 		st, _ = st.WithDetails(errInfo)
 		return nil, st.Err()
 	}
-	if output == "ALL" {
-		acctSqlConfig := fmt.Sprintf("SELECT DISTINCT acct FROM %s_assoc_table WHERE deleted = 0 AND acct != ?", clusterName)
-		rows, err := db.Query(acctSqlConfig, in.AccountName)
-		if err != nil {
+	defer allRows.Close()
+	var allAcctList []string
+	for allRows.Next() {
+		var a string
+		if err := allRows.Scan(&a); err != nil {
 			errInfo := &errdetails.ErrorInfo{
 				Reason: "SQL_QUERY_FAILED",
 			}
@@ -1030,34 +1037,31 @@ func (s *serverAccount) BlockAccount(ctx context.Context, in *pb.BlockAccountReq
 			st, _ = st.WithDetails(errInfo)
 			return nil, st.Err()
 		}
-		defer rows.Close()
-		for rows.Next() {
-			err := rows.Scan(&assocAcctName)
-			if err != nil {
-				errInfo := &errdetails.ErrorInfo{
-					Reason: "SQL_QUERY_FAILED",
-				}
-				st := status.New(codes.Internal, err.Error())
-				st, _ = st.WithDetails(errInfo)
-				return nil, st.Err()
-			}
-			acctList = append(acctList, assocAcctName)
+		allAcctList = append(allAcctList, a)
+	}
+	if err := allRows.Err(); err != nil {
+		errInfo := &errdetails.ErrorInfo{
+			Reason: "SQL_QUERY_FAILED",
 		}
-		err = rows.Err()
-		if err != nil {
-			errInfo := &errdetails.ErrorInfo{
-				Reason: "SQL_QUERY_FAILED",
-			}
-			st := status.New(codes.Internal, err.Error())
-			st, _ = st.WithDetails(errInfo)
-			return nil, st.Err()
-		}
-		allowAcct := strings.Join(acctList, ",")
-		for _, v := range partitions {
-			getconfacctcmd := fmt.Sprintf("grep %s -r %s/etc/ 2>/dev/null |awk '{ for(i=1; i<=NF; i++) if(tolower($i) ~ /allowaccounts/) print $i }'|awk -F= '{print $NF}'", v, slurmpath)
-			confacct := string("")
-			confacct, err = utils.RunCommand(getconfacctcmd)
-			if err != nil {
+		st := status.New(codes.Internal, err.Error())
+		st, _ = st.WithDetails(errInfo)
+		return nil, st.Err()
+	}
+	allAcctStr := strings.Join(allAcctList, ",")
+
+	// 逐分区独立处理 AllowAccounts，不同分区可能有不同的 AllowAccounts 配置。
+	for _, p := range partitions {
+		var updateAcct string
+		if confAcct, ok := confAllowMap[p]; ok {
+			// slurm.conf 中为该分区定义了固定的 AllowAccounts，以配置文件为准，
+			// 不受封禁操作影响（账户层面的封禁已通过 sacctmgr maxsubmit=0 完成）。
+			updateAcct = confAcct
+		} else {
+			// 通过 scontrol 获取该分区当前运行时的 AllowAccounts 值。
+			// 每个分区单独查询，确保不同 AllowAccounts 配置的分区各自正确处理。
+			getAllowAcctCmd := fmt.Sprintf("scontrol show partition %s | grep AllowAccounts | awk '{print $2}' | awk -F '=' '{print $2}'", p)
+			output, err := utils.RunCommand(getAllowAcctCmd)
+			if err != nil || utils.CheckSlurmStatus(output) {
 				errInfo := &errdetails.ErrorInfo{
 					Reason: "COMMAND_EXEC_FAILED",
 				}
@@ -1065,51 +1069,22 @@ func (s *serverAccount) BlockAccount(ctx context.Context, in *pb.BlockAccountReq
 				st, _ = st.WithDetails(errInfo)
 				return nil, st.Err()
 			}
-			if confacct != "" {
-				allowAcct = confacct
-			}
-
-			updatePartitionAllowAcctCmd := fmt.Sprintf("scontrol update partition='%s' AllowAccounts='%s'", v, allowAcct)
-			retcode := utils.ExecuteShellCommand(updatePartitionAllowAcctCmd)
-			if retcode != 0 {
-				errInfo := &errdetails.ErrorInfo{
-					Reason: "COMMAND_EXEC_FAILED",
+			if output == "ALL" {
+				// 该分区当前允许所有账户；封禁时需将其改为除被封账户之外的显式列表，
+				// 使用前面预查询的全量账户（已排除被封账户）。
+				updateAcct = allAcctStr
+			} else {
+				// 该分区已有显式的账户白名单；从中移除被封账户。
+				// 若被封账户本就不在该分区的白名单中，则无需更新，直接跳过。
+				acctList := strings.Split(output, ",")
+				if arrays.ContainsString(acctList, in.AccountName) == -1 {
+					continue
 				}
-				st := status.New(codes.Internal, "Exec command failed.")
-				st, _ = st.WithDetails(errInfo)
-				return nil, st.Err()
+				updateAcct = strings.Join(utils.DeleteSlice(acctList, in.AccountName), ",")
 			}
 		}
-		return &pb.BlockAccountResponse{}, nil
-	}
-	// output的值包含了系统中所有的分区信息
-	AllowAcctList := strings.Split(output, ",")
-	// 判断账户名是否在AllowAcctList中
-	index := arrays.ContainsString(AllowAcctList, in.AccountName)
-	if index == -1 {
-		return &pb.BlockAccountResponse{}, nil
-	}
-	// 账户存在AllowAcctList中，则删除账户后更新计算分区AllowAccounts
-	updateAllowAcct := utils.DeleteSlice(AllowAcctList, in.AccountName)
-	for _, p := range partitions {
-		getconfacctcmd := fmt.Sprintf("grep %s -r %s/etc/ 2>/dev/null|awk '{ for(i=1; i<=NF; i++) if(tolower($i) ~ /allowaccounts/) print $i }'|awk -F= '{print $NF}'", p, slurmpath)
-		//getconfacctcmd := fmt.Sprintf("grep -i AllowAccounts -r $(dirname $(scontrol show conf | grep SLURM_CONF | awk '{print $NF}'))|grep -v '^#'| grep %s | awk -F AllowAccounts= '{print $2}' | awk '{print $1}'", p)
-		confacct := string("")
-		confacct, err = utils.RunCommand(getconfacctcmd)
-		if err != nil {
-			errInfo := &errdetails.ErrorInfo{
-				Reason: "COMMAND_EXEC_FAILED",
-			}
-			st := status.New(codes.Internal, "Exec command failed or slurmctld down.")
-			st, _ = st.WithDetails(errInfo)
-			return nil, st.Err()
-		}
-		updatePartitionAllowAcctCmd := fmt.Sprintf("scontrol update partition=%s AllowAccounts=%s", p, strings.Join(updateAllowAcct, ","))
-		if confacct != "" {
-			updatePartitionAllowAcctCmd = fmt.Sprintf("scontrol update partition=%s AllowAccounts=%s", p, confacct)
-		}
-		code := utils.ExecuteShellCommand(updatePartitionAllowAcctCmd)
-		if code != 0 {
+		updatePartitionAllowAcctCmd := fmt.Sprintf("scontrol update partition='%s' AllowAccounts='%s'", p, updateAcct)
+		if code := utils.ExecuteShellCommand(updatePartitionAllowAcctCmd); code != 0 {
 			errInfo := &errdetails.ErrorInfo{
 				Reason: "COMMAND_EXEC_FAILED",
 			}
@@ -1126,7 +1101,6 @@ func (s *serverAccount) UnblockAccount(ctx context.Context, in *pb.UnblockAccoun
 		acctName string
 	)
 	// 记录日志
-	slurmpath := utils.GetSlurmPath()
 	logger.Infof("Received request UnblockAccount: %v", in)
 	// 检查用户名中是否包含大写字母
 	resultAcct := utils.CheckAccountOrUserStrings(in.AccountName)
@@ -1160,9 +1134,19 @@ func (s *serverAccount) UnblockAccount(ctx context.Context, in *pb.UnblockAccoun
 		st, _ = st.WithDetails(errInfo)
 		return nil, st.Err()
 	}
-	getAllowAcctCmd := fmt.Sprintf("scontrol show partition %s | grep AllowAccounts | awk '{print $2}' | awk -F '=' '{print $2}'", partitions[0])
-	output, err := utils.RunCommand(getAllowAcctCmd)
-	if err != nil || utils.CheckSlurmStatus(output) {
+	// 解析 slurm.conf（含 include 文件）获取各分区显式定义的 AllowAccounts。
+	// 逻辑同 BlockAccount：不在 map 中的分区按运行时值动态处理。
+	// 若解析失败则打印警告并使用空 map，不中断解封主流程。
+	confAllowMap, confErr := utils.GetPartitionAllowAccountsFromConf()
+	if confErr != nil {
+		logger.Warnf("UnblockAccount: failed to parse slurm.conf AllowAccounts: %v", confErr)
+		confAllowMap = map[string]string{}
+	}
+	// 通过 sacctmgr 恢复被封账户的作业提交上限（-1 表示无限制）。
+	// 这是解封的核心步骤，在分区循环之外统一执行一次即可。
+	allowmaxjobcmd := fmt.Sprintf("sacctmgr -i modify account %s set maxsubmitjobs=-1", in.AccountName)
+	_, err = utils.RunCommand(allowmaxjobcmd)
+	if err != nil {
 		errInfo := &errdetails.ErrorInfo{
 			Reason: "COMMAND_EXEC_FAILED",
 		}
@@ -1170,30 +1154,18 @@ func (s *serverAccount) UnblockAccount(ctx context.Context, in *pb.UnblockAccoun
 		st, _ = st.WithDetails(errInfo)
 		return nil, st.Err()
 	}
-	if output == "ALL" {
-		return &pb.UnblockAccountResponse{}, nil
-	}
-	AllowAcctList := strings.Split(output, ",")
-	index := arrays.ContainsString(AllowAcctList, in.AccountName)
-	if index == -1 {
-		// 不在里面的话需要解封
-		AllowAcctList = append(AllowAcctList, in.AccountName)
-		allowmaxjobcmd := fmt.Sprintf("sacctmgr -i modify account %s set maxsubmitjobs=-1", strings.Join(AllowAcctList, ","))
-		_, err := utils.RunCommand(allowmaxjobcmd)
-		if err != nil {
-			errInfo := &errdetails.ErrorInfo{
-				Reason: "COMMAND_EXEC_FAILED",
-			}
-			st := status.New(codes.Internal, "Exec command failed or slurmctld down.")
-			st, _ = st.WithDetails(errInfo)
-			return nil, st.Err()
-		}
-		for _, p := range partitions {
-			getconfacctcmd := fmt.Sprintf("grep %s -r %s/etc/ 2>/dev/null |awk '{ for(i=1; i<=NF; i++) if(tolower($i) ~ /allowaccounts/) print $i }'|awk -F= '{print $NF}'", p, slurmpath)
-			//getconfacctcmd := fmt.Sprintf("grep -i AllowAccounts -r $(dirname $(scontrol show conf | grep SLURM_CONF | awk '{print $NF}'))|grep -v '^#'| grep %s | awk -F AllowAccounts= '{print $2}' | awk '{print $1}'", p)
-			confacct := string("")
-			confacct, err = utils.RunCommand(getconfacctcmd)
-			if err != nil {
+	// 逐分区独立更新 AllowAccounts，不同分区可能有不同的配置。
+	for _, p := range partitions {
+		var updateAcct string
+		if confAcct, ok := confAllowMap[p]; ok {
+			// slurm.conf 中为该分区定义了固定的 AllowAccounts，以配置文件为准。
+			// 解封操作不修改该分区的 AllowAccounts，直接用 conf 值写回（保持一致）。
+			updateAcct = confAcct
+		} else {
+			// 通过 scontrol 获取该分区当前运行时的 AllowAccounts 值。
+			getAllowAcctCmd := fmt.Sprintf("scontrol show partition %s | grep AllowAccounts | awk '{print $2}' | awk -F '=' '{print $2}'", p)
+			output, err := utils.RunCommand(getAllowAcctCmd)
+			if err != nil || utils.CheckSlurmStatus(output) {
 				errInfo := &errdetails.ErrorInfo{
 					Reason: "COMMAND_EXEC_FAILED",
 				}
@@ -1201,21 +1173,28 @@ func (s *serverAccount) UnblockAccount(ctx context.Context, in *pb.UnblockAccoun
 				st, _ = st.WithDetails(errInfo)
 				return nil, st.Err()
 			}
-			updatePartitionAllowAcctCmd := fmt.Sprintf("scontrol update partition=%s AllowAccounts=%s", p, strings.Join(AllowAcctList, ","))
-			if confacct != "" {
-				updatePartitionAllowAcctCmd = fmt.Sprintf("scontrol update partition=%s AllowAccounts=%s", p, confacct)
+			if output == "ALL" {
+				// 该分区 AllowAccounts=ALL，本就允许所有账户，无需修改。
+				continue
 			}
-			retcode := utils.ExecuteShellCommand(updatePartitionAllowAcctCmd)
-			if retcode != 0 {
-				errInfo := &errdetails.ErrorInfo{
-					Reason: "COMMAND_EXEC_FAILED",
-				}
-				st := status.New(codes.Internal, "Exec command failed.")
-				st, _ = st.WithDetails(errInfo)
-				return nil, st.Err()
+			acctList := strings.Split(output, ",")
+			if arrays.ContainsString(acctList, in.AccountName) != -1 {
+				// 账户已在该分区的白名单中，无需重复添加。
+				continue
 			}
+			// 将解封账户追加到该分区的 AllowAccounts 白名单中。
+			acctList = append(acctList, in.AccountName)
+			updateAcct = strings.Join(acctList, ",")
 		}
-		return &pb.UnblockAccountResponse{}, nil
+		updatePartitionAllowAcctCmd := fmt.Sprintf("scontrol update partition=%s AllowAccounts=%s", p, updateAcct)
+		if retcode := utils.ExecuteShellCommand(updatePartitionAllowAcctCmd); retcode != 0 {
+			errInfo := &errdetails.ErrorInfo{
+				Reason: "COMMAND_EXEC_FAILED",
+			}
+			st := status.New(codes.Internal, "Exec command failed.")
+			st, _ = st.WithDetails(errInfo)
+			return nil, st.Err()
+		}
 	}
 	return &pb.UnblockAccountResponse{}, nil
 }
@@ -3626,7 +3605,14 @@ func (s *serverJob) GetJobs(ctx context.Context, in *pb.GetJobsRequest) (*pb.Get
 			// 四种情况
 			if len(in.Filter.Users) != 0 && len(in.Filter.States) != 0 {
 				for _, user := range in.Filter.Users {
-					uid, _, _ := utils.GetUserUidGid(user)
+					// GetUserUidGid 内部带 5 秒超时，防止 LDAP 等认证服务
+					// 对不存在的用户无限阻塞导致整个请求挂死。
+					// 查询失败（用户不在 OS 中或超时）时跳过该用户，不影响其他用户。
+					uid, _, err := utils.GetUserUidGid(user)
+					if err != nil {
+						logger.Warnf("GetJobs: skip user %s, OS lookup failed: %v", user, err)
+						continue
+					}
 					uidList = append(uidList, uid)
 				}
 				for _, state := range in.Filter.States {
@@ -3650,7 +3636,14 @@ func (s *serverJob) GetJobs(ctx context.Context, in *pb.GetJobsRequest) (*pb.Get
 				}
 			} else if len(in.Filter.Users) != 0 && len(in.Filter.States) == 0 {
 				for _, user := range in.Filter.Users {
-					uid, _, _ := utils.GetUserUidGid(user)
+					// GetUserUidGid 内部带 5 秒超时，防止 LDAP 等认证服务
+					// 对不存在的用户无限阻塞导致整个请求挂死。
+					// 查询失败（用户不在 OS 中或超时）时跳过该用户，不影响其他用户。
+					uid, _, err := utils.GetUserUidGid(user)
+					if err != nil {
+						logger.Warnf("GetJobs: skip user %s, OS lookup failed: %v", user, err)
+						continue
+					}
 					uidList = append(uidList, uid)
 				}
 				uidListString := strings.Trim(strings.Join(strings.Fields(fmt.Sprint(uidList)), ","), "[]")
@@ -3720,7 +3713,14 @@ func (s *serverJob) GetJobs(ctx context.Context, in *pb.GetJobsRequest) (*pb.Get
 			// 四种情况
 			if len(in.Filter.Users) != 0 && len(in.Filter.States) != 0 {
 				for _, user := range in.Filter.Users {
-					uid, _, _ := utils.GetUserUidGid(user)
+					// GetUserUidGid 内部带 5 秒超时，防止 LDAP 等认证服务
+					// 对不存在的用户无限阻塞导致整个请求挂死。
+					// 查询失败（用户不在 OS 中或超时）时跳过该用户，不影响其他用户。
+					uid, _, err := utils.GetUserUidGid(user)
+					if err != nil {
+						logger.Warnf("GetJobs: skip user %s, OS lookup failed: %v", user, err)
+						continue
+					}
 					uidList = append(uidList, uid)
 				}
 				for _, state := range in.Filter.States {
@@ -3740,7 +3740,14 @@ func (s *serverJob) GetJobs(ctx context.Context, in *pb.GetJobsRequest) (*pb.Get
 				}
 			} else if len(in.Filter.Users) != 0 && len(in.Filter.States) == 0 {
 				for _, user := range in.Filter.Users {
-					uid, _, _ := utils.GetUserUidGid(user)
+					// GetUserUidGid 内部带 5 秒超时，防止 LDAP 等认证服务
+					// 对不存在的用户无限阻塞导致整个请求挂死。
+					// 查询失败（用户不在 OS 中或超时）时跳过该用户，不影响其他用户。
+					uid, _, err := utils.GetUserUidGid(user)
+					if err != nil {
+						logger.Warnf("GetJobs: skip user %s, OS lookup failed: %v", user, err)
+						continue
+					}
 					uidList = append(uidList, uid)
 				}
 				uidListString := strings.Trim(strings.Join(strings.Fields(fmt.Sprint(uidList)), ","), "[]")

@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
+	"time"
 
 	"os/exec"
 	"os/user"
@@ -304,26 +307,59 @@ func GetResInfoNumFromTresInfo(tresInfo string, resId int) int {
 	return resInfoNum
 }
 
-// 根据指定用户名获取uid
+// 根据用户名获取系统中对应的 uid 和 gid。
+// 由于底层调用 user.Lookup() 会经过 NSS（如 LDAP/NIS），当用户不存在于
+// 认证系统或认证服务响应慢时可能无限阻塞，因此将查询放入独立 goroutine，
+// 并通过 select 设置 5 秒超时：超时后返回 error，调用方应跳过该用户。
 func GetUserUidGid(username string) (int, int, error) {
-	u, err := user.Lookup(username)
-	if err != nil {
-		return -1, -1, err
+	type result struct {
+		uid int
+		gid int
+		err error
 	}
-	uid := u.Uid
-	gid := u.Gid
-	uidInt, _ := strconv.Atoi(uid)
-	gidInt, _ := strconv.Atoi(gid)
-	return uidInt, gidInt, nil
+	ch := make(chan result, 1)
+	go func() {
+		u, err := user.Lookup(username)
+		if err != nil {
+			ch <- result{-1, -1, err}
+			return
+		}
+		uidInt, _ := strconv.Atoi(u.Uid)
+		gidInt, _ := strconv.Atoi(u.Gid)
+		ch <- result{uidInt, gidInt, nil}
+	}()
+	select {
+	case r := <-ch:
+		return r.uid, r.gid, r.err
+	case <-time.After(5 * time.Second):
+		// 5 秒内未收到结果，判定为超时（LDAP 等认证服务无响应）
+		return -1, -1, fmt.Errorf("timeout looking up OS user %s", username)
+	}
 }
 
-// 根据指定的uid获取用户名
+// 根据 uid 反查操作系统用户名。同 GetUserUidGid，使用 goroutine + 超时
+// 防止 LDAP 查询慢导致调用方挂起，超时阈值同为 5 秒。
 func GetUserNameByUid(uid int) (string, error) {
-	u, err := user.LookupId(strconv.Itoa(uid))
-	if err != nil {
-		return "", err
+	type result struct {
+		name string
+		err  error
 	}
-	return u.Username, nil
+	ch := make(chan result, 1)
+	go func() {
+		u, err := user.LookupId(strconv.Itoa(uid))
+		if err != nil {
+			ch <- result{"", err}
+			return
+		}
+		ch <- result{u.Username, nil}
+	}()
+	select {
+	case r := <-ch:
+		return r.name, r.err
+	case <-time.After(5 * time.Second):
+		// 5 秒内未收到结果，判定为超时
+		return "", fmt.Errorf("timeout looking up OS user by uid %d", uid)
+	}
 }
 
 // 判断字符串中是否包含大写字母
@@ -601,4 +637,119 @@ func GetSlurmPath() string {
 		slurmpath = "/usr"
 	}
 	return slurmpath
+}
+
+// GetSlurmConfPath 通过 scontrol show conf 获取 slurm.conf 的绝对路径。
+// slurm.conf 的实际位置因集群安装路径而异，不能硬编码，需动态获取。
+func GetSlurmConfPath() (string, error) {
+	output, err := RunCommand("scontrol show conf | grep '^SLURM_CONF' | awk '{print $NF}'")
+	if err != nil {
+		return "", fmt.Errorf("failed to get SLURM_CONF path: %w", err)
+	}
+	return strings.TrimSpace(output), nil
+}
+
+// GetPartitionAllowAccountsFromConf 解析 slurm.conf 及其通过 include 指令
+// 引入的所有子文件，返回"分区名 -> AllowAccounts 值"的映射表。
+//
+// 只收录显式设置了非 ALL 值的分区；不在返回 map 中的分区表示其
+// AllowAccounts=ALL（允许所有账户）或未设置该字段，调用方应按动态逻辑处理。
+func GetPartitionAllowAccountsFromConf() (map[string]string, error) {
+	confPath, err := GetSlurmConfPath()
+	if err != nil {
+		return nil, err
+	}
+	if confPath == "" {
+		return nil, fmt.Errorf("SLURM_CONF path is empty")
+	}
+	result := make(map[string]string)
+	// visited 用于防止 include 循环引用导致死递归
+	if err := parseConfFile(confPath, result, make(map[string]bool)); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// parseConfFile 递归读取一个 slurm.conf 格式的文件及其 include 文件，
+// 将 PartitionName -> AllowAccounts 的映射写入 result。
+//
+// 解析规则：
+//   - '#' 及其后的内容视为注释，在处理前截断
+//   - 'include <路径>' 行递归解析指定文件（支持 glob 通配符）
+//   - 以 PartitionName= 开头的行为分区定义，字段名大小写不敏感
+//   - 分区名和账户名的值保留原始大小写（Slurm 对分区名区分大小写）
+//   - AllowAccounts=ALL 或未设置的分区不写入 result
+func parseConfFile(path string, result map[string]string, visited map[string]bool) error {
+	// 防止循环 include
+	if visited[path] {
+		return nil
+	}
+	visited[path] = true
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(path)
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		// 截断行内注释并去除首尾空白
+		line := rawLine
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = line[:idx]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// 用小写版本做关键字匹配，保持大小写不敏感
+		lower := strings.ToLower(line)
+
+		// 处理 include 指令，递归解析引入的配置文件
+		if strings.HasPrefix(lower, "include ") {
+			parts := strings.Fields(line)
+			if len(parts) < 2 {
+				continue
+			}
+			inc := parts[1]
+			// 相对路径以 slurm.conf 所在目录为基准
+			if !filepath.IsAbs(inc) {
+				inc = filepath.Join(dir, inc)
+			}
+			// 支持通配符（如 include /etc/slurm/partitions_*.conf）
+			matches, _ := filepath.Glob(inc)
+			for _, m := range matches {
+				_ = parseConfFile(m, result, visited)
+			}
+			continue
+		}
+
+		// 只处理分区定义行（以 PartitionName= 开头）
+		if !strings.HasPrefix(lower, "partitionname=") {
+			continue
+		}
+
+		// 逐字段解析 key=value，提取 PartitionName 和 AllowAccounts
+		var partName, allowAccounts string
+		for _, field := range strings.Fields(line) {
+			idx := strings.Index(field, "=")
+			if idx < 0 {
+				continue
+			}
+			k := strings.ToLower(field[:idx]) // 字段名不区分大小写
+			v := field[idx+1:]                // 值保留原始大小写
+			switch k {
+			case "partitionname":
+				partName = v
+			case "allowaccounts":
+				allowAccounts = v
+			}
+		}
+		// 仅记录明确限制了账户列表的分区（非空且非 ALL）
+		if partName != "" && allowAccounts != "" && !strings.EqualFold(allowAccounts, "ALL") {
+			result[partName] = allowAccounts
+		}
+	}
+	return nil
 }
