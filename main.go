@@ -4371,6 +4371,11 @@ func main() {
 	logger.SetOutput(io.MultiWriter(os.Stdout, logFile))
 	defer logFile.Close()
 
+	// 初始化分区 AllowAccounts SQLite 缓存，后台每分钟自动刷新
+	if err := utils.InitPartitionCache(); err != nil {
+		logger.Warnf("InitPartitionCache failed (non-fatal): %v", err)
+	}
+
 	// 启动服务
 	port := configValue.Service.Port
 	portString := fmt.Sprintf(":%d", port)

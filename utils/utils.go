@@ -310,42 +310,52 @@ func GetResInfoNumFromTresInfo(tresInfo string, resId int) int {
 // 根据用户名获取系统中对应的 uid 和 gid。
 // 由于底层调用 user.Lookup() 会经过 NSS（如 LDAP/NIS），当用户不存在于
 // 认证系统或认证服务响应慢时可能无限阻塞，因此将查询放入独立 goroutine，
-// 并通过 select 设置 5 秒超时：超时后返回 error，调用方应跳过该用户。
+// 并通过 select 设置 500ms 超时：超时后返回 error，调用方应跳过该用户。
+// 500ms 对本地及远程 LDAP 查询均有足够余量，同时避免批量处理时
+// 因大量不存在用户累积过长等待时间（如 100 个用户最多累积 50 秒）。
 func GetUserUidGid(username string) (int, int, error) {
+	// result 用于在 goroutine 和主 goroutine 之间传递查询结果
 	type result struct {
 		uid int
 		gid int
 		err error
 	}
+	// 带缓冲的 channel，goroutine 结束后即使主 goroutine 已超时也能安全写入，不会泄漏
 	ch := make(chan result, 1)
 	go func() {
+		// user.Lookup 会经过 NSS，在 LDAP/NIS 环境下可能因网络延迟而阻塞
 		u, err := user.Lookup(username)
 		if err != nil {
 			ch <- result{-1, -1, err}
 			return
 		}
+		// os/user 返回的 Uid/Gid 是字符串，转换为整数供调用方使用
 		uidInt, _ := strconv.Atoi(u.Uid)
 		gidInt, _ := strconv.Atoi(u.Gid)
 		ch <- result{uidInt, gidInt, nil}
 	}()
 	select {
 	case r := <-ch:
+		// 在超时前收到结果，直接返回
 		return r.uid, r.gid, r.err
-	case <-time.After(5 * time.Second):
-		// 5 秒内未收到结果，判定为超时（LDAP 等认证服务无响应）
+	case <-time.After(500 * time.Millisecond):
+		// 500ms 内未收到结果，判定为超时（用户不存在或认证服务无响应）
+		// 调用方收到 error 后应跳过该用户，继续处理下一个
 		return -1, -1, fmt.Errorf("timeout looking up OS user %s", username)
 	}
 }
 
 // 根据 uid 反查操作系统用户名。同 GetUserUidGid，使用 goroutine + 超时
-// 防止 LDAP 查询慢导致调用方挂起，超时阈值同为 5 秒。
+// 防止 LDAP 查询慢导致调用方挂起，超时阈值同为 500ms。
 func GetUserNameByUid(uid int) (string, error) {
 	type result struct {
 		name string
 		err  error
 	}
+	// 带缓冲 channel，防止超时后 goroutine 写入时阻塞导致泄漏
 	ch := make(chan result, 1)
 	go func() {
+		// user.LookupId 同样经过 NSS，在 LDAP 环境下可能阻塞
 		u, err := user.LookupId(strconv.Itoa(uid))
 		if err != nil {
 			ch <- result{"", err}
@@ -356,8 +366,8 @@ func GetUserNameByUid(uid int) (string, error) {
 	select {
 	case r := <-ch:
 		return r.name, r.err
-	case <-time.After(5 * time.Second):
-		// 5 秒内未收到结果，判定为超时
+	case <-time.After(500 * time.Millisecond):
+		// 500ms 内未收到结果，判定为超时（uid 对应用户不存在或认证服务无响应）
 		return "", fmt.Errorf("timeout looking up OS user by uid %d", uid)
 	}
 }
@@ -649,12 +659,14 @@ func GetSlurmConfPath() (string, error) {
 	return strings.TrimSpace(output), nil
 }
 
-// GetPartitionAllowAccountsFromConf 解析 slurm.conf 及其通过 include 指令
-// 引入的所有子文件，返回"分区名 -> AllowAccounts 值"的映射表。
+// parsePartitionAllowAccounts 解析 slurm.conf 及其通过 include 指令引入的所有子文件，
+// 返回"分区名 -> AllowAccounts 值"的映射表，仅收录显式设置了非 ALL 值的分区。
 //
-// 只收录显式设置了非 ALL 值的分区；不在返回 map 中的分区表示其
-// AllowAccounts=ALL（允许所有账户）或未设置该字段，调用方应按动态逻辑处理。
-func GetPartitionAllowAccountsFromConf() (map[string]string, error) {
+// 此函数为内部实现，仅供 partition_cache.go 的 doRefreshPartitionCache() 调用，
+// 每次调用都会读取磁盘文件，速度较慢。
+// 外部代码应通过 GetPartitionAllowAccountsFromConf()（定义在 partition_cache.go）读取，
+// 以获得 SQLite + 内存缓存加速，避免频繁解析磁盘文件。
+func parsePartitionAllowAccounts() (map[string]string, error) {
 	confPath, err := GetSlurmConfPath()
 	if err != nil {
 		return nil, err
@@ -680,7 +692,7 @@ func GetPartitionAllowAccountsFromConf() (map[string]string, error) {
 //   - 分区名和账户名的值保留原始大小写（Slurm 对分区名区分大小写）
 //   - AllowAccounts=ALL 或未设置的分区不写入 result
 func parseConfFile(path string, result map[string]string, visited map[string]bool) error {
-	// 防止循环 include
+	// visited 记录已处理的文件路径，防止 include 形成环状引用导致无限递归
 	if visited[path] {
 		return nil
 	}
@@ -691,9 +703,11 @@ func parseConfFile(path string, result map[string]string, visited map[string]boo
 		return err
 	}
 
+	// dir 用于将 include 中的相对路径拼接为绝对路径
 	dir := filepath.Dir(path)
 	for _, rawLine := range strings.Split(string(data), "\n") {
-		// 截断行内注释并去除首尾空白
+		// slurm.conf 中 '#' 后为注释，支持行内注释（如 "Key=val # remark"）
+		// 截断注释部分，再去除首尾空白
 		line := rawLine
 		if idx := strings.Index(line, "#"); idx >= 0 {
 			line = line[:idx]
@@ -703,33 +717,37 @@ func parseConfFile(path string, result map[string]string, visited map[string]boo
 			continue
 		}
 
-		// 用小写版本做关键字匹配，保持大小写不敏感
+		// 构造小写版本用于关键字比较，保持大小写不敏感；
+		// 字段值仍从原始 line 中取，保留 Slurm 对分区名的大小写敏感性
 		lower := strings.ToLower(line)
 
 		// 处理 include 指令，递归解析引入的配置文件
+		// 例如：include /etc/slurm/partitions_*.conf
 		if strings.HasPrefix(lower, "include ") {
 			parts := strings.Fields(line)
 			if len(parts) < 2 {
 				continue
 			}
 			inc := parts[1]
-			// 相对路径以 slurm.conf 所在目录为基准
+			// 相对路径以当前文件所在目录为基准，与 slurm.conf 行为一致
 			if !filepath.IsAbs(inc) {
 				inc = filepath.Join(dir, inc)
 			}
-			// 支持通配符（如 include /etc/slurm/partitions_*.conf）
+			// filepath.Glob 展开通配符，匹配失败时 matches 为空，直接跳过
 			matches, _ := filepath.Glob(inc)
 			for _, m := range matches {
+				// 忽略子文件的解析错误，不影响主文件继续处理
 				_ = parseConfFile(m, result, visited)
 			}
 			continue
 		}
 
-		// 只处理分区定义行（以 PartitionName= 开头）
+		// 跳过非分区定义行（slurm.conf 中全局参数、注释等均不处理）
 		if !strings.HasPrefix(lower, "partitionname=") {
 			continue
 		}
 
+		// 分区定义行格式：PartitionName=<name> Key1=Val1 Key2=Val2 ...
 		// 逐字段解析 key=value，提取 PartitionName 和 AllowAccounts
 		var partName, allowAccounts string
 		for _, field := range strings.Fields(line) {
@@ -737,8 +755,8 @@ func parseConfFile(path string, result map[string]string, visited map[string]boo
 			if idx < 0 {
 				continue
 			}
-			k := strings.ToLower(field[:idx]) // 字段名不区分大小写
-			v := field[idx+1:]                // 值保留原始大小写
+			k := strings.ToLower(field[:idx]) // 字段名不区分大小写（Slurm 本身也不区分）
+			v := field[idx+1:]                // 字段值保留原始大小写
 			switch k {
 			case "partitionname":
 				partName = v
@@ -746,7 +764,8 @@ func parseConfFile(path string, result map[string]string, visited map[string]boo
 				allowAccounts = v
 			}
 		}
-		// 仅记录明确限制了账户列表的分区（非空且非 ALL）
+		// 只收录明确限制了账户列表的分区（值非空且不是 ALL）
+		// AllowAccounts=ALL 或未设置表示允许所有账户，不需要写入缓存
 		if partName != "" && allowAccounts != "" && !strings.EqualFold(allowAccounts, "ALL") {
 			result[partName] = allowAccounts
 		}
