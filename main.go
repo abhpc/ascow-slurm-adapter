@@ -4313,6 +4313,88 @@ func (s *serverJob) SubmitScriptAsJob(ctx context.Context, in *pb.SubmitScriptAs
 	}
 }
 
+// GetLowLoadJobs 返回运行中 CPU 负载低于 threshold% 的作业（任意节点低于阈值即纳入）。
+// threshold <= 0 时默认使用 10.0%。
+func (s *serverJob) GetLowLoadJobs(ctx context.Context, in *pb.GetLowLoadJobsRequest) (*pb.GetLowLoadJobsResponse, error) {
+	threshold := in.Threshold
+	if threshold <= 0 {
+		threshold = 10.0
+	}
+	logger.Infof("GetLowLoadJobs called, threshold=%.1f%%", threshold)
+
+	// 1. 获取所有运行中作业：JOBID USER ACCOUNT NODELIST(compact)
+	squeueOut, err := utils.RunCommand(`squeue -t R -o "%A %u %a %R" --noheader`)
+	if err != nil || strings.TrimSpace(squeueOut) == "" {
+		return &pb.GetLowLoadJobsResponse{Jobs: []*pb.LowLoadJobInfo{}}, nil
+	}
+
+	// 2. 一次性获取所有节点负载：NODE LOAD CPUS
+	sinfoOut, err := utils.RunCommand(`sinfo -o "%n %O %c" --noheader`)
+	if err != nil {
+		errInfo := &errdetails.ErrorInfo{
+			Reason: "GET_NODE_INFO_FAILED",
+		}
+		st := status.New(codes.Internal, "sinfo failed")
+		st, _ = st.WithDetails(errInfo)
+		return nil, st.Err()
+	}
+	nodeLoadMap := make(map[string]float64)
+	for _, line := range strings.Split(strings.TrimSpace(sinfoOut), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		load, err1 := strconv.ParseFloat(fields[1], 64)
+		cpus, err2 := strconv.ParseFloat(fields[2], 64)
+		if err1 != nil || err2 != nil || cpus <= 0 {
+			continue
+		}
+		nodeLoadMap[fields[0]] = 100.0 * load / cpus
+	}
+
+	// 3. 遍历每个作业
+	var result []*pb.LowLoadJobInfo
+	for _, line := range strings.Split(strings.TrimSpace(squeueOut), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		jobID64, err := strconv.ParseUint(fields[0], 10, 32)
+		if err != nil {
+			continue
+		}
+
+		// 展开紧凑节点列表（如 node[01-03]）
+		expandedOut, err := utils.RunCommand("scontrol show hostname " + fields[3])
+		if err != nil {
+			continue
+		}
+
+		var nodeInfos []*pb.NodeLoadInfo
+		lowLoadFound := false
+		for _, node := range strings.Fields(expandedOut) {
+			loadPct, ok := nodeLoadMap[node]
+			if !ok {
+				loadPct = -1
+			}
+			nodeInfos = append(nodeInfos, &pb.NodeLoadInfo{Node: node, LoadPercent: loadPct})
+			if ok && loadPct < threshold {
+				lowLoadFound = true
+			}
+		}
+
+		if lowLoadFound {
+			result = append(result, &pb.LowLoadJobInfo{
+				JobId:   uint32(jobID64),
+				User:    fields[1],
+				Account: fields[2],
+				Nodes:   nodeInfos,
+			})
+		}
+	}
+	return &pb.GetLowLoadJobsResponse{Jobs: result}, nil
+}
+
 func main() {
 	var (
 		err error
