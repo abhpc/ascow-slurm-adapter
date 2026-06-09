@@ -1,9 +1,10 @@
 ARCH ?= amd64
 
-protos: 
-	buf generate --template buf.gen.yaml https://github.com/abhpc/ascow-scheduler-adapter-interface.git#subdir=protos
+protos:
+	buf generate --template buf.gen.yaml ../ascow-scheduler-adapter-interface/protos
 
 ##subdir=protos,tag=v1.9.0
+##remote (broken with newer buf): buf generate --template buf.gen.yaml https://github.com/abhpc/ascow-scheduler-adapter-interface.git#subdir=protos
 
 run: 
 	go run *.go 
