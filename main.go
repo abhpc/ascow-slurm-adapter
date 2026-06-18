@@ -969,7 +969,7 @@ func (s *serverAccount) BlockAccount(ctx context.Context, in *pb.BlockAccountReq
 		return nil, st.Err()
 	}
 
-	actblockcmd := fmt.Sprintf("sacctmgr -i modify account %s set maxsubmit=0", in.AccountName)
+	actblockcmd := fmt.Sprintf("sacctmgr -i modify account %s set maxsubmitjobs=0", in.AccountName)
 	_, err1 := utils.RunCommand(actblockcmd)
 	if err1 != nil {
 		errInfo := &errdetails.ErrorInfo{
@@ -1054,7 +1054,7 @@ func (s *serverAccount) BlockAccount(ctx context.Context, in *pb.BlockAccountReq
 		var updateAcct string
 		if confAcct, ok := confAllowMap[p]; ok {
 			// slurm.conf 中为该分区定义了固定的 AllowAccounts，以配置文件为准，
-			// 不受封禁操作影响（账户层面的封禁已通过 sacctmgr maxsubmit=0 完成）。
+			// 不受封禁操作影响（账户层面的封禁已通过 sacctmgr maxsubmitjobs=0 完成）。
 			updateAcct = confAcct
 		} else {
 			// 通过 scontrol 获取该分区当前运行时的 AllowAccounts 值。
