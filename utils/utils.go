@@ -78,15 +78,20 @@ func ExecuteShellCommand(command string) int {
 		res int
 	)
 	cmd := exec.Command("bash", "-c", command)
-	stdout, _ := cmd.StdoutPipe()
-	defer stdout.Close()
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
 	if err := cmd.Start(); err != nil {
-		panic(err)
+		log.Printf("failed to start command %q: %v", command, err)
+		return 1
 	}
 	if err := cmd.Wait(); err != nil {
 		if ex, ok := err.(*exec.ExitError); ok {
 			res = ex.Sys().(syscall.WaitStatus).ExitStatus()
+		} else {
+			res = 1
 		}
+		log.Printf("command %q failed with exit code %d: %s", command, res, strings.TrimSpace(output.String()))
 	}
 	return res
 }

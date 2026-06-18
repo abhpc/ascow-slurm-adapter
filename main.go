@@ -38,6 +38,30 @@ var (
 	logger      *logrus.Logger
 )
 
+func recoverUnaryInterceptor(
+	ctx context.Context,
+	req interface{},
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (resp interface{}, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if logger != nil {
+				logger.Errorf("panic recovered in %s: %v", info.FullMethod, r)
+			} else {
+				log.Printf("panic recovered in %s: %v", info.FullMethod, r)
+			}
+			errInfo := &errdetails.ErrorInfo{
+				Reason: "PANIC_RECOVERED",
+			}
+			st := status.New(codes.Internal, "Internal server error.")
+			st, _ = st.WithDetails(errInfo)
+			err = st.Err()
+		}
+	}()
+	return handler(ctx, req)
+}
+
 type serverUser struct {
 	pb.UnimplementedUserServiceServer
 }
@@ -4470,6 +4494,7 @@ func main() {
 	s := grpc.NewServer(
 		grpc.MaxRecvMsgSize(1024*1024*1024), // 最大接受size 1GB
 		grpc.MaxSendMsgSize(1024*1024*1024), // 最大发送size 1GB
+		grpc.UnaryInterceptor(recoverUnaryInterceptor),
 	) // 创建gRPC服务器
 	pb.RegisterUserServiceServer(s, &serverUser{})
 	pb.RegisterAccountServiceServer(s, &serverAccount{})
