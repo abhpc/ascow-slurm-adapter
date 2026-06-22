@@ -4419,6 +4419,87 @@ func (s *serverJob) GetLowLoadJobs(ctx context.Context, in *pb.GetLowLoadJobsReq
 	return &pb.GetLowLoadJobsResponse{Jobs: result}, nil
 }
 
+// GetRunningJobsLoad 返回所有运行中作业的逐节点 CPU 负载及平均负载。
+// 通过单次 sinfo 一次性获取全部节点负载，避免每作业重复调用，降低开销。
+func (s *serverJob) GetRunningJobsLoad(ctx context.Context, in *pb.GetRunningJobsLoadRequest) (*pb.GetRunningJobsLoadResponse, error) {
+	logger.Infof("GetRunningJobsLoad called")
+
+	// 1. 获取所有运行中作业：JOBID NODELIST(compact)
+	squeueOut, err := utils.RunCommand(`squeue -t R -o "%A %R" --noheader`)
+	if err != nil || strings.TrimSpace(squeueOut) == "" {
+		return &pb.GetRunningJobsLoadResponse{Jobs: []*pb.RunningJobLoadInfo{}}, nil
+	}
+
+	// 2. 一次性获取所有节点负载：NODE LOAD CPUS
+	sinfoOut, err := utils.RunCommand(`sinfo -o "%n %O %c" --noheader`)
+	if err != nil {
+		errInfo := &errdetails.ErrorInfo{
+			Reason: "GET_NODE_INFO_FAILED",
+		}
+		st := status.New(codes.Internal, "sinfo failed")
+		st, _ = st.WithDetails(errInfo)
+		return nil, st.Err()
+	}
+	nodeLoadMap := make(map[string]float64)
+	for _, line := range strings.Split(strings.TrimSpace(sinfoOut), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		load, err1 := strconv.ParseFloat(fields[1], 64)
+		cpus, err2 := strconv.ParseFloat(fields[2], 64)
+		if err1 != nil || err2 != nil || cpus <= 0 {
+			continue
+		}
+		nodeLoadMap[fields[0]] = 100.0 * load / cpus
+	}
+
+	// 3. 遍历每个作业，计算逐节点负载与平均负载
+	var result []*pb.RunningJobLoadInfo
+	for _, line := range strings.Split(strings.TrimSpace(squeueOut), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		jobID64, err := strconv.ParseUint(fields[0], 10, 32)
+		if err != nil {
+			continue
+		}
+
+		// 展开紧凑节点列表（如 node[01-03]）
+		expandedOut, err := utils.RunCommand("scontrol show hostname " + fields[1])
+		if err != nil {
+			continue
+		}
+
+		var nodeInfos []*pb.NodeLoadInfo
+		var loadSum float64
+		var validCount int
+		for _, node := range strings.Fields(expandedOut) {
+			loadPct, ok := nodeLoadMap[node]
+			if !ok {
+				loadPct = -1
+			} else {
+				loadSum += loadPct
+				validCount++
+			}
+			nodeInfos = append(nodeInfos, &pb.NodeLoadInfo{Node: node, LoadPercent: loadPct})
+		}
+
+		avg := -1.0
+		if validCount > 0 {
+			avg = loadSum / float64(validCount)
+		}
+
+		result = append(result, &pb.RunningJobLoadInfo{
+			JobId:              uint32(jobID64),
+			Nodes:              nodeInfos,
+			AverageLoadPercent: avg,
+		})
+	}
+	return &pb.GetRunningJobsLoadResponse{Jobs: result}, nil
+}
+
 func main() {
 	var (
 		err error
