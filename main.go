@@ -3902,7 +3902,7 @@ func (s *serverJob) GetJobs(ctx context.Context, in *pb.GetJobsRequest) (*pb.Get
 				nodeReq = nodesAlloc
 				elapsedSeconds = 0
 				//if output == "cons_tres" || output == "cons_res" {
-				getGpusPernodeCmd := fmt.Sprintf("scontrol show job %d 2>&1 |awk -F'gpu:' '/TresPerNode/ {print $NF}'", jobId)
+				getGpusPernodeCmd := fmt.Sprintf("scontrol show job %d 2>&1 |awk -F':' '/TresPerNode/ {print $NF}'", jobId)
 				gpusPerNodeStr, err := utils.RunCommand(getGpusPernodeCmd)
 				if err != nil {
 					logger.Info("Error running getGpusPernodeCmd:", err)
