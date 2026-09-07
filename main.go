@@ -2571,9 +2571,8 @@ func extractNodeInfo(info string) *pb.NodeInfo {
 	if totalGpus == "(null)" {
 		totalGpusInt = 0
 	} else {
-		totalGpusStrWithBrace := strings.Split(totalGpus, ":")[1]
-		totalGpusStr := strings.Split(totalGpusStrWithBrace, "(")[0]
-		totalGpusInt, _ = strconv.Atoi(totalGpusStr)
+		totalGpusParts := strings.Split(strings.Split(totalGpus, "(")[0], ":")
+		totalGpusInt, _ = strconv.Atoi(totalGpusParts[len(totalGpusParts)-1])
 	}
 	allocGpus := utils.ExtractValue(info, "AllocTRES")
 	if allocGpus == "" {
