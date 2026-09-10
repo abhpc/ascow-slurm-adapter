@@ -2394,11 +2394,21 @@ func (s *serverConfig) GetClusterInfo(ctx context.Context, in *pb.GetClusterInfo
 		st, _ = st.WithDetails(errInfo)
 		return nil, st.Err()
 	}
+	nodeDetails, err := utils.RunCommand("scontrol show nodes -dd --oneliner")
+	if err != nil || utils.CheckSlurmStatus(nodeDetails) {
+		errInfo := &errdetails.ErrorInfo{Reason: "COMMAND_EXEC_FAILED"}
+		st := status.New(codes.Internal, "Exec command failed or slurmctld down.")
+		st, _ = st.WithDetails(errInfo)
+		return nil, st.Err()
+	}
+	partitionGpuStatsByName := parsePartitionGpuStats(nodeDetails)
+
 	for _, v := range partitions {
-		var runningGpus int
-		var idleGpus int
-		var noAvailableGpus int
-		var totalGpus int
+		gpuStats := partitionGpuStatsByName[v]
+		runningGpus := gpuStats.running
+		idleGpus := gpuStats.idle
+		noAvailableGpus := gpuStats.unavailable
+		totalGpus := gpuStats.total
 		var totalCores int
 		var idleCores int
 		var runningCores int
@@ -2454,18 +2464,6 @@ func (s *serverConfig) GetClusterInfo(ctx context.Context, in *pb.GetClusterInfo
 			idleCores = idleCores + idleCoresTmp
 			noAvailableCoresTmp, _ := strconv.Atoi(coresInfo[2])
 			noAvailableCores = noAvailableCores + noAvailableCoresTmp
-			// fmt.Println("Partition Element:", partitionElement)
-			gpuInfo := resultList[3] // 这是gpu的信息
-			if gpuInfo == "(null)" {
-				runningGpus = 0
-				idleGpus = 0
-				noAvailableGpus = 0
-				totalGpus = 0
-			} else {
-				singerNodeGpusInt := parseGpuCount(gpuInfo)
-				noAvailableGpus = noAvailableGpus + noAvailableNodes*singerNodeGpusInt
-				totalGpus = totalGpus + singerNodeGpusInt*totalNodes
-			}
 		}
 
 		// resultList := strings.Split(result, " ")
@@ -2585,28 +2583,6 @@ func (s *serverConfig) GetClusterInfo(ctx context.Context, in *pb.GetClusterInfo
 				return nil, st.Err()
 			}
 			runningJobNum, _ = strconv.Atoi(runningResult)
-			if runningJobNum != 0 {
-				// 获取正在使用的GPU卡数
-				useGpuCardstr := fmt.Sprintf("squeue -p %s -t r ", v)
-				useGpuCardCmd := useGpuCardstr + " " + " --format='%b %D' --noheader | awk -F':' '{print $NF}' | awk '{sum+=$1 *$2} END {print sum}'"
-				useGpuCardResult, err := utils.RunCommand(useGpuCardCmd)
-				if err != nil || utils.CheckSlurmStatus(useGpuCardResult) {
-					errInfo := &errdetails.ErrorInfo{
-						Reason: "COMMAND_EXEC_FAILED",
-					}
-					st := status.New(codes.Internal, "Exec command failed or slurmctld down.")
-					st, _ = st.WithDetails(errInfo)
-					return nil, st.Err()
-				}
-				runningGpus, _ = strconv.Atoi(useGpuCardResult)
-				// noAvailableGpus = noAvailableNodes * singerNodeGpusInt
-				idleGpus = totalGpus - runningGpus - noAvailableGpus
-			} else {
-				runningGpus = 0
-				// noAvailableGpus = noAvailableNodes * singerNodeGpusInt
-				// idleGpus = idleNodes * singerNodeGpusInt
-				idleGpus = totalGpus - noAvailableGpus
-			}
 			resultRatio := float64(runningNodes) / float64(totalNodes)
 			percentage := int(resultRatio * 100) // 保留整数
 			if state == "up" {
@@ -2697,6 +2673,33 @@ func parseGpuCount(gres string) int {
 	return count
 }
 
+type partitionGpuStats struct {
+	total       int
+	running     int
+	idle        int
+	unavailable int
+}
+
+func parsePartitionGpuStats(output string) map[string]partitionGpuStats {
+	statsByPartition := map[string]partitionGpuStats{}
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		node := extractNodeInfo(scanner.Text())
+		for _, partition := range node.Partitions {
+			stats := statsByPartition[partition]
+			stats.total += int(node.GpuCount)
+			if node.State == pb.NodeInfo_NOT_AVAILABLE {
+				stats.unavailable += int(node.GpuCount)
+			} else {
+				stats.running += int(node.AllocGpuCount)
+				stats.idle += int(node.IdleGpuCount)
+			}
+			statsByPartition[partition] = stats
+		}
+	}
+	return statsByPartition
+}
+
 func extractNodeInfo(info string) *pb.NodeInfo {
 	var (
 		partitionList []string
@@ -2728,23 +2731,7 @@ func extractNodeInfo(info string) *pb.NodeInfo {
 	allocCpuCores := utils.ExtractValue(info, "CPUAlloc")
 	allocCpuCoresInt, _ := strconv.Atoi(allocCpuCores)
 	totalGpusInt = parseGpuCount(utils.ExtractValue(info, "Gres"))
-	allocGpus := utils.ExtractValue(info, "AllocTRES")
-	if allocGpus == "" {
-		allocGpusInt = 0
-	} else {
-		if strings.Contains(allocGpus, "gpu") {
-			allocRes := strings.Split(allocGpus, ",")
-			for _, res := range allocRes {
-				if strings.Contains(res, "gpu") {
-					gpuAllocResStr := strings.Split(res, "=")[1]
-					allocGpusInt, _ = strconv.Atoi(gpuAllocResStr)
-					break
-				}
-			}
-		} else {
-			allocGpusInt = 0
-		}
-	}
+	allocGpusInt = parseGpuCount(utils.ExtractValue(info, "GresUsed"))
 
 	return &pb.NodeInfo{
 		NodeName:          nodeName,
@@ -2765,7 +2752,7 @@ func extractNodeInfo(info string) *pb.NodeInfo {
 func getNodeInfo(node string, wg *sync.WaitGroup, nodeChan chan<- *pb.NodeInfo, errChan chan<- error) {
 	defer wg.Done()
 
-	getNodeInfoCmd := fmt.Sprintf("scontrol show nodes %s --oneliner", node)
+	getNodeInfoCmd := fmt.Sprintf("scontrol show nodes %s -dd --oneliner", node)
 	info, err := utils.RunCommand(getNodeInfoCmd)
 	if err != nil {
 		errInfo := &errdetails.ErrorInfo{
@@ -2793,7 +2780,7 @@ func (s *serverConfig) GetClusterNodesInfo(ctx context.Context, in *pb.GetCluste
 
 	if len(in.NodeNames) == 0 {
 		// 获取集群中全部节点的信息
-		getNodesInfoCmd := "scontrol show nodes --oneliner | grep Partitions" // 获取全部计算节点主机名
+		getNodesInfoCmd := "scontrol show nodes -dd --oneliner | grep Partitions" // 获取全部计算节点主机名
 		output, err := utils.RunCommand(getNodesInfoCmd)
 		if err != nil {
 			errInfo := &errdetails.ErrorInfo{
