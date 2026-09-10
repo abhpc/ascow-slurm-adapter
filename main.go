@@ -1811,13 +1811,8 @@ func (s *serverConfig) GetClusterConfig(ctx context.Context, in *pb.GetClusterCo
 				st, _ = st.WithDetails(errInfo)
 				return nil, st.Err()
 			}
-			if gpusOutput == "Gres=(null)" {
-				totalGpus = 0
-			} else {
-				// 字符串转整型
-				perNodeGpuNum, _ := strconv.Atoi(gpusOutput)
-				totalGpus = uint32(perNodeGpuNum) * uint32(totalNodeNumInt)
-			}
+			perNodeGpuNum := parseGpuCount(gpusOutput)
+			totalGpus = uint32(perNodeGpuNum) * uint32(totalNodeNumInt)
 		} else {
 			getGpusCmd := fmt.Sprintf("scontrol show node=%s| grep ' Gres=' | awk -F':' '{print $NF}'", nodeArray[0])
 			gpusOutput, err := utils.RunCommand(getGpusCmd)
@@ -1829,12 +1824,8 @@ func (s *serverConfig) GetClusterConfig(ctx context.Context, in *pb.GetClusterCo
 				st, _ = st.WithDetails(errInfo)
 				return nil, st.Err()
 			}
-			if gpusOutput == "Gres=(null)" {
-				totalGpus = 0
-			} else {
-				perNodeGpuNum, _ := strconv.Atoi(gpusOutput)
-				totalGpus = uint32(perNodeGpuNum) * uint32(totalNodeNumInt)
-			}
+			perNodeGpuNum := parseGpuCount(gpusOutput)
+			totalGpus = uint32(perNodeGpuNum) * uint32(totalNodeNumInt)
 		}
 		getPartitionQosCmd := fmt.Sprintf("scontrol show partition=%s | grep -i ' QoS=' | awk '{print $3}'", partition)
 		qosOutput, err := utils.RunCommand(getPartitionQosCmd)
@@ -2180,13 +2171,8 @@ func (s *serverConfig) GetAvailablePartitions(ctx context.Context, in *pb.GetAva
 					st, _ = st.WithDetails(errInfo)
 					return nil, st.Err()
 				}
-				if gpusOutput == "Gres=(null)" {
-					totalGpus = 0
-				} else {
-					// 字符串转整型
-					perNodeGpuNum, _ := strconv.Atoi(gpusOutput)
-					totalGpus = uint32(perNodeGpuNum) * uint32(totalNodeNumInt)
-				}
+				perNodeGpuNum := parseGpuCount(gpusOutput)
+				totalGpus = uint32(perNodeGpuNum) * uint32(totalNodeNumInt)
 			} else {
 				getGpusCmd := fmt.Sprintf("scontrol show node=%s| grep ' Gres=' | awk -F':' '{print $NF}'", nodeArray[0])
 				gpusOutput, err := utils.RunCommand(getGpusCmd)
@@ -2198,12 +2184,8 @@ func (s *serverConfig) GetAvailablePartitions(ctx context.Context, in *pb.GetAva
 					st, _ = st.WithDetails(errInfo)
 					return nil, st.Err()
 				}
-				if gpusOutput == "Gres=(null)" {
-					totalGpus = 0
-				} else {
-					perNodeGpuNum, _ := strconv.Atoi(gpusOutput)
-					totalGpus = uint32(perNodeGpuNum) * uint32(totalNodeNumInt)
-				}
+				perNodeGpuNum := parseGpuCount(gpusOutput)
+				totalGpus = uint32(perNodeGpuNum) * uint32(totalNodeNumInt)
 			}
 			getPartitionQosCmd := fmt.Sprintf("scontrol show partition=%s | grep -i ' QoS=' | awk '{print $3}'", partition)
 			qosOutput, err := utils.RunCommand(getPartitionQosCmd)
@@ -2253,6 +2235,146 @@ func (s *serverConfig) GetAvailablePartitions(ctx context.Context, in *pb.GetAva
 		}
 	}
 	return &pb.GetAvailablePartitionsResponse{Partitions: parts}, nil
+}
+
+type clusterInfoTotals struct {
+	nodes [4]uint32 // running, idle, unavailable, total
+	cpus  [4]uint32
+	gpus  [4]uint32
+	jobs  [2]uint32 // running, pending
+}
+
+type clusterNodeStats struct {
+	nodes [4]uint32
+	cpus  [4]uint32
+	gpus  uint32
+}
+
+func parseSlurmStateCounts(value string) ([4]uint32, error) {
+	var counts [4]uint32
+	parts := strings.Split(value, "/")
+	if len(parts) != len(counts) {
+		return counts, fmt.Errorf("invalid Slurm state counts %q", value)
+	}
+	for i, part := range parts {
+		count, err := strconv.ParseUint(part, 10, 32)
+		if err != nil {
+			return counts, fmt.Errorf("invalid Slurm state count %q: %w", part, err)
+		}
+		counts[i] = uint32(count)
+	}
+	if uint64(counts[0])+uint64(counts[1])+uint64(counts[2]) != uint64(counts[3]) {
+		return counts, fmt.Errorf("inconsistent Slurm state counts %q", value)
+	}
+	return counts, nil
+}
+
+func parseClusterInfoTotals(sinfoOutput, squeueOutput string) (clusterInfoTotals, error) {
+	var totals clusterInfoTotals
+	nodes := map[string]clusterNodeStats{}
+
+	for _, line := range strings.Split(strings.TrimSpace(sinfoOutput), "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) != 5 || strings.TrimSpace(fields[0]) == "" {
+			return totals, fmt.Errorf("invalid sinfo row %q", line)
+		}
+		nodeCounts, err := parseSlurmStateCounts(strings.TrimSpace(fields[2]))
+		if err != nil {
+			return totals, err
+		}
+		if nodeCounts[3] != 1 {
+			return totals, fmt.Errorf("sinfo row %q does not represent one physical node", line)
+		}
+		cpuCounts, err := parseSlurmStateCounts(strings.TrimSpace(fields[3]))
+		if err != nil {
+			return totals, err
+		}
+		gpuCount := parseGpuCount(strings.TrimSpace(fields[4]))
+		if gpuCount < 0 {
+			return totals, fmt.Errorf("invalid GPU count in sinfo row %q", line)
+		}
+		nodeName := strings.TrimSpace(fields[0])
+		stats := clusterNodeStats{
+			nodes: nodeCounts,
+			cpus:  cpuCounts,
+			gpus:  uint32(gpuCount),
+		}
+		if previous, ok := nodes[nodeName]; ok {
+			if previous != stats {
+				return totals, fmt.Errorf("inconsistent sinfo rows for node %q", nodeName)
+			}
+			continue
+		}
+		nodes[nodeName] = stats
+	}
+	if len(nodes) == 0 {
+		return totals, fmt.Errorf("sinfo returned no nodes")
+	}
+
+	for _, stats := range nodes {
+		for i := range totals.nodes {
+			totals.nodes[i] += stats.nodes[i]
+			totals.cpus[i] += stats.cpus[i]
+		}
+		totals.gpus[3] += stats.gpus
+		if stats.nodes[2] > 0 {
+			totals.gpus[2] += stats.gpus
+		}
+	}
+
+	if strings.TrimSpace(squeueOutput) != "" {
+		for _, line := range strings.Split(strings.TrimSpace(squeueOutput), "\n") {
+			fields := strings.Split(line, "|")
+			if len(fields) != 4 {
+				return totals, fmt.Errorf("invalid squeue row %q", line)
+			}
+			switch strings.TrimSpace(fields[1]) {
+			case "RUNNING":
+				totals.jobs[0]++
+				gres := strings.TrimSpace(fields[2])
+				if strings.Contains(strings.ToLower(gres), "gpu") {
+					nodeCount, err := strconv.ParseUint(strings.TrimSpace(fields[3]), 10, 32)
+					if err != nil {
+						return totals, fmt.Errorf("invalid squeue node count in row %q: %w", line, err)
+					}
+					gpuCount := parseGpuCount(gres)
+					if gpuCount < 0 {
+						return totals, fmt.Errorf("invalid GPU count in squeue row %q", line)
+					}
+					totals.gpus[0] += uint32(gpuCount) * uint32(nodeCount)
+				}
+			case "PENDING":
+				totals.jobs[1]++
+			default:
+				return totals, fmt.Errorf("unexpected squeue state in row %q", line)
+			}
+		}
+	}
+
+	if uint64(totals.gpus[0])+uint64(totals.gpus[2]) > uint64(totals.gpus[3]) {
+		return totals, fmt.Errorf("running and unavailable GPUs exceed total GPUs")
+	}
+	totals.gpus[1] = totals.gpus[3] - totals.gpus[0] - totals.gpus[2]
+
+	return totals, nil
+}
+
+func getClusterInfoTotals() (clusterInfoTotals, error) {
+	sinfoOutput, err := utils.RunCommand("sinfo -a -N -e -h -o '%N|%P|%F|%C|%G'")
+	if err != nil {
+		return clusterInfoTotals{}, fmt.Errorf("failed to query cluster resources: %w", err)
+	}
+	if utils.CheckSlurmStatus(sinfoOutput) {
+		return clusterInfoTotals{}, fmt.Errorf("failed to query cluster resources: %s", sinfoOutput)
+	}
+	squeueOutput, err := utils.RunCommand("squeue -h -r -t R,PD -o '%i|%T|%b|%D'")
+	if err != nil {
+		return clusterInfoTotals{}, fmt.Errorf("failed to query cluster jobs: %w", err)
+	}
+	if utils.CheckSlurmStatus(squeueOutput) {
+		return clusterInfoTotals{}, fmt.Errorf("failed to query cluster jobs: %s", squeueOutput)
+	}
+	return parseClusterInfoTotals(sinfoOutput, squeueOutput)
 }
 
 func (s *serverConfig) GetClusterInfo(ctx context.Context, in *pb.GetClusterInfoRequest) (*pb.GetClusterInfoResponse, error) {
@@ -2340,9 +2462,7 @@ func (s *serverConfig) GetClusterInfo(ctx context.Context, in *pb.GetClusterInfo
 				noAvailableGpus = 0
 				totalGpus = 0
 			} else {
-				singerNodeGpusInfo := strings.Split(gpuInfo, ":")
-				singerNodeGpus := singerNodeGpusInfo[len(singerNodeGpusInfo)-1] // 获取最后一个元素
-				singerNodeGpusInt, _ := strconv.Atoi(singerNodeGpus)
+				singerNodeGpusInt := parseGpuCount(gpuInfo)
 				noAvailableGpus = noAvailableGpus + noAvailableNodes*singerNodeGpusInt
 				totalGpus = totalGpus + singerNodeGpusInt*totalNodes
 			}
@@ -2534,7 +2654,47 @@ func (s *serverConfig) GetClusterInfo(ctx context.Context, in *pb.GetClusterInfo
 			}
 		}
 	}
-	return &pb.GetClusterInfoResponse{ClusterName: clusterName, Partitions: parts}, nil
+	clusterTotals, err := getClusterInfoTotals()
+	if err != nil {
+		errInfo := &errdetails.ErrorInfo{Reason: "COMMAND_EXEC_FAILED"}
+		st := status.New(codes.Internal, err.Error())
+		st, _ = st.WithDetails(errInfo)
+		return nil, st.Err()
+	}
+
+	return &pb.GetClusterInfoResponse{
+		ClusterName:           clusterName,
+		Partitions:            parts,
+		NodeCount:             clusterTotals.nodes[3],
+		RunningNodeCount:      clusterTotals.nodes[0],
+		IdleNodeCount:         clusterTotals.nodes[1],
+		NotAvailableNodeCount: clusterTotals.nodes[2],
+		CpuCoreCount:          clusterTotals.cpus[3],
+		RunningCpuCount:       clusterTotals.cpus[0],
+		IdleCpuCount:          clusterTotals.cpus[1],
+		NotAvailableCpuCount:  clusterTotals.cpus[2],
+		GpuCoreCount:          clusterTotals.gpus[3],
+		RunningGpuCount:       clusterTotals.gpus[0],
+		IdleGpuCount:          clusterTotals.gpus[1],
+		NotAvailableGpuCount:  clusterTotals.gpus[2],
+		JobCount:              clusterTotals.jobs[0] + clusterTotals.jobs[1],
+		RunningJobCount:       clusterTotals.jobs[0],
+		PendingJobCount:       clusterTotals.jobs[1],
+	}, nil
+}
+
+func parseGpuCount(gres string) int {
+	gres = strings.TrimPrefix(strings.TrimSpace(gres), "Gres=")
+	if gres == "" || gres == "(null)" {
+		return 0
+	}
+
+	parts := strings.Split(strings.Split(gres, "(")[0], ":")
+	count, err := strconv.Atoi(parts[len(parts)-1])
+	if err != nil {
+		return 1
+	}
+	return count
 }
 
 func extractNodeInfo(info string) *pb.NodeInfo {
@@ -2567,13 +2727,7 @@ func extractNodeInfo(info string) *pb.NodeInfo {
 	totalCpuCoresInt, _ := strconv.Atoi(totalCpuCores)
 	allocCpuCores := utils.ExtractValue(info, "CPUAlloc")
 	allocCpuCoresInt, _ := strconv.Atoi(allocCpuCores)
-	totalGpus := utils.ExtractValue(info, "Gres")
-	if totalGpus == "(null)" {
-		totalGpusInt = 0
-	} else {
-		totalGpusParts := strings.Split(strings.Split(totalGpus, "(")[0], ":")
-		totalGpusInt, _ = strconv.Atoi(totalGpusParts[len(totalGpusParts)-1])
-	}
+	totalGpusInt = parseGpuCount(utils.ExtractValue(info, "Gres"))
 	allocGpus := utils.ExtractValue(info, "AllocTRES")
 	if allocGpus == "" {
 		allocGpusInt = 0
