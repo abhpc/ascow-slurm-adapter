@@ -77,3 +77,17 @@ func TestParseClusterInfoTotalsRejectsInconsistentDuplicateNode(t *testing.T) {
 		t.Fatal("parseClusterInfoTotals() succeeded for inconsistent duplicate node")
 	}
 }
+
+func TestParsePartitionGpuStatsMarksSharedGpuUsedInEveryPartition(t *testing.T) {
+	info := "NodeName=node01 CPUAlloc=10 CPUTot=16 Gres=gpu:1 GresUsed=gpu:1 " +
+		"RealMemory=30000 AllocMem=18750 State=MIXED Partitions=local,Partition2"
+
+	got := parsePartitionGpuStats(info)
+	want := partitionGpuStats{total: 1, running: 1}
+
+	for _, partition := range []string{"local", "Partition2"} {
+		if got[partition] != want {
+			t.Fatalf("parsePartitionGpuStats()[%q] = %+v, want %+v", partition, got[partition], want)
+		}
+	}
+}
