@@ -18,7 +18,7 @@
 ## 2 安装
 ### 2.1 系统要求
 
-[Buf](https://buf.build/docs/installation/)
+[Buf<=1.25.0](https://buf.build/docs/installation/)
 
 [Git>=2.18.0](https://github.com/git/git)
 
