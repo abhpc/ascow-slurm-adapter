@@ -3,3 +3,7 @@ scow-slurm-adapter-*
 
 # Generated protobuf code
 gen/
+
+# Local agent state and instructions
+.omo/
+AGENTS.md
