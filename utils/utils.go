@@ -2,7 +2,6 @@ package utils
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -313,54 +312,69 @@ func GetResInfoNumFromTresInfo(tresInfo string, resId int) int {
 	return resInfoNum
 }
 
-type systemUserLookupField int
-
-const (
-	systemUsernameField systemUserLookupField = 0
-	systemUIDField      systemUserLookupField = 2
-)
-
-// Native getent retains LDAP/NSS semantics when the adapter is built without CGO.
-// Numeric names fail safely if keyed getent returns a different account by UID.
-func lookupSystemUser(key string, field systemUserLookupField) (*user.User, error) {
-	if key == "" || strings.ContainsAny(key, "\r\n\x00") {
-		return nil, fmt.Errorf("invalid system user key")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	output, err := exec.CommandContext(ctx, "getent", "passwd", "--", key).Output()
-	if err != nil {
-		return nil, fmt.Errorf("lookup system user: %w", err)
-	}
-	fields := strings.Split(strings.TrimSpace(string(output)), ":")
-	if len(fields) != 7 || fields[0] == "" || fields[field] != key {
-		return nil, fmt.Errorf("invalid system user record")
-	}
-	return &user.User{Username: fields[0], Uid: fields[2], Gid: fields[3], HomeDir: fields[5]}, nil
-}
-
+// 根据用户名获取系统中对应的 uid 和 gid。
+// 由于底层调用 user.Lookup() 会经过 NSS（如 LDAP/NIS），当用户不存在于
+// 认证系统或认证服务响应慢时可能无限阻塞，因此将查询放入独立 goroutine，
+// 并通过 select 设置 500ms 超时：超时后返回 error，调用方应跳过该用户。
+// 500ms 对本地及远程 LDAP 查询均有足够余量，同时避免批量处理时
+// 因大量不存在用户累积过长等待时间（如 100 个用户最多累积 50 秒）。
 func GetUserUidGid(username string) (int, int, error) {
-	u, err := lookupSystemUser(username, systemUsernameField)
-	if err != nil {
-		return -1, -1, err
+	// result 用于在 goroutine 和主 goroutine 之间传递查询结果
+	type result struct {
+		uid int
+		gid int
+		err error
 	}
-	uid, err := strconv.Atoi(u.Uid)
-	if err != nil {
-		return -1, -1, fmt.Errorf("parse system UID: %w", err)
+	// 带缓冲的 channel，goroutine 结束后即使主 goroutine 已超时也能安全写入，不会泄漏
+	ch := make(chan result, 1)
+	go func() {
+		// user.Lookup 会经过 NSS，在 LDAP/NIS 环境下可能因网络延迟而阻塞
+		u, err := user.Lookup(username)
+		if err != nil {
+			ch <- result{-1, -1, err}
+			return
+		}
+		// os/user 返回的 Uid/Gid 是字符串，转换为整数供调用方使用
+		uidInt, _ := strconv.Atoi(u.Uid)
+		gidInt, _ := strconv.Atoi(u.Gid)
+		ch <- result{uidInt, gidInt, nil}
+	}()
+	select {
+	case r := <-ch:
+		// 在超时前收到结果，直接返回
+		return r.uid, r.gid, r.err
+	case <-time.After(500 * time.Millisecond):
+		// 500ms 内未收到结果，判定为超时（用户不存在或认证服务无响应）
+		// 调用方收到 error 后应跳过该用户，继续处理下一个
+		return -1, -1, fmt.Errorf("timeout looking up OS user %s", username)
 	}
-	gid, err := strconv.Atoi(u.Gid)
-	if err != nil {
-		return -1, -1, fmt.Errorf("parse system GID: %w", err)
-	}
-	return uid, gid, nil
 }
 
+// 根据 uid 反查操作系统用户名。同 GetUserUidGid，使用 goroutine + 超时
+// 防止 LDAP 查询慢导致调用方挂起，超时阈值同为 500ms。
 func GetUserNameByUid(uid int) (string, error) {
-	u, err := lookupSystemUser(strconv.Itoa(uid), systemUIDField)
-	if err != nil {
-		return "", err
+	type result struct {
+		name string
+		err  error
 	}
-	return u.Username, nil
+	// 带缓冲 channel，防止超时后 goroutine 写入时阻塞导致泄漏
+	ch := make(chan result, 1)
+	go func() {
+		// user.LookupId 同样经过 NSS，在 LDAP 环境下可能阻塞
+		u, err := user.LookupId(strconv.Itoa(uid))
+		if err != nil {
+			ch <- result{"", err}
+			return
+		}
+		ch <- result{u.Username, nil}
+	}()
+	select {
+	case r := <-ch:
+		return r.name, r.err
+	case <-time.After(500 * time.Millisecond):
+		// 500ms 内未收到结果，判定为超时（uid 对应用户不存在或认证服务无响应）
+		return "", fmt.Errorf("timeout looking up OS user by uid %d", uid)
+	}
 }
 
 // 判断字符串中是否包含大写字母
@@ -458,7 +472,7 @@ func LocalFileSubmitJob(filePath string, username string) (string, error) {
 
 func GetUserHomedir(username string) (string, error) {
 	// 获取指定用户名的用户信息
-	u, err := lookupSystemUser(username, systemUsernameField)
+	u, err := user.Lookup(username)
 	if err != nil {
 		return "", err
 	}

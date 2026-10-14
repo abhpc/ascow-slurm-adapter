@@ -7,9 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 
 	"fmt"
 	"math"
@@ -18,6 +16,7 @@ import (
 	"scow-slurm-adapter/utils"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	pb "scow-slurm-adapter/gen/go"
@@ -2736,6 +2735,8 @@ func extractNodeInfo(info string) *pb.NodeInfo {
 
 	return &pb.NodeInfo{
 		NodeName:          nodeName,
+		NodeAddr:          utils.ExtractValue(info, "NodeAddr"),
+		NodeHostname:      utils.ExtractValue(info, "NodeHostName"),
 		Partitions:        partitionList,
 		State:             nodeState,
 		CpuCoreCount:      uint32(totalCpuCoresInt),
@@ -2750,105 +2751,87 @@ func extractNodeInfo(info string) *pb.NodeInfo {
 	}
 }
 
-var nodeExpression = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.,\[\]-]*$`)
-var nodeIdentifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+func getNodeInfo(node string, wg *sync.WaitGroup, nodeChan chan<- *pb.NodeInfo, errChan chan<- error) {
+	defer wg.Done()
 
-// GetClusterNodesInfo returns complete scheduler records, never metadata destinations.
-func (s *serverConfig) GetClusterNodesInfo(ctx context.Context, in *pb.GetClusterNodesInfoRequest) (*pb.GetClusterNodesInfoResponse, error) {
-	if len(in.NodeNames) > 4096 {
-		return nil, status.Error(codes.InvalidArgument, "Too many node expressions")
-	}
-	inputBytes := 0
-	for _, expression := range in.NodeNames {
-		inputBytes += len(expression)
-		if len(expression) > 65536 || !nodeExpression.MatchString(expression) || inputBytes > 65536 {
-			return nil, status.Error(codes.InvalidArgument, "Invalid node expression")
-		}
-	}
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	expected := make(map[string]bool)
-	names := make([]string, 0)
-	for _, expression := range in.NodeNames {
-		output, err := exec.CommandContext(ctx, "scontrol", "show", "hostnames", expression).Output()
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, status.FromContextError(ctx.Err()).Err()
-			}
-			return nil, status.Error(codes.Internal, "Slurm node expansion failed")
-		}
-		expanded := strings.Fields(string(output))
-		if len(expanded) == 0 || len(expanded) > 4096 {
-			return nil, status.Error(codes.Internal, "Invalid Slurm node expansion")
-		}
-		for _, name := range expanded {
-			if !nodeIdentifier.MatchString(name) {
-				return nil, status.Error(codes.Internal, "Invalid Slurm node identifier")
-			}
-			if !expected[name] {
-				expected[name] = true
-				names = append(names, name)
-			}
-			if len(names) > 4096 {
-				return nil, status.Error(codes.ResourceExhausted, "Too many expanded nodes")
-			}
-		}
-	}
-	args := []string{"show", "nodes", "-dd", "--oneliner"}
-	if len(names) > 0 {
-		args = append(args, strings.Join(names, ","))
-	}
-	output, err := exec.CommandContext(ctx, "scontrol", args...).Output()
+	getNodeInfoCmd := fmt.Sprintf("scontrol show nodes %s -dd --oneliner", node)
+	info, err := utils.RunCommand(getNodeInfoCmd)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, status.FromContextError(ctx.Err()).Err()
+		errInfo := &errdetails.ErrorInfo{
+			Reason: "COMMAND_EXEC_FAILED",
 		}
-		return nil, status.Error(codes.Internal, "Slurm node query failed")
+		st := status.New(codes.Internal, "Exec command failed or slurmctld down.")
+		st, _ = st.WithDetails(errInfo)
+		errChan <- st.Err()
+		return
 	}
-	nodes := make([]*pb.NodeInfo, 0)
-	seen := make(map[string]bool)
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
-	scanner.Buffer(make([]byte, 4096), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		fields := make(map[string]string)
-		for _, field := range strings.Fields(line) {
-			key, value, found := strings.Cut(field, "=")
-			if found {
-				if _, duplicate := fields[key]; duplicate && (key == "NodeName" || key == "NodeAddr" || key == "NodeHostName") {
-					return nil, status.Error(codes.Internal, "Ambiguous Slurm node record")
-				}
-				fields[key] = value
+
+	nodeInfo := extractNodeInfo(info)
+
+	nodeChan <- nodeInfo
+}
+
+func (s *serverConfig) GetClusterNodesInfo(ctx context.Context, in *pb.GetClusterNodesInfoRequest) (*pb.GetClusterNodesInfoResponse, error) {
+	var (
+		wg        sync.WaitGroup
+		nodesInfo []*pb.NodeInfo
+	)
+	logger.Infof("Received request GetClusterNodesInfo: %v", in)
+	nodeChan := make(chan *pb.NodeInfo, len(in.NodeNames))
+	errChan := make(chan error, len(in.NodeNames))
+
+	if len(in.NodeNames) == 0 {
+		// 获取集群中全部节点的信息
+		getNodesInfoCmd := "scontrol show nodes -dd --oneliner | grep Partitions" // 获取全部计算节点主机名
+		output, err := utils.RunCommand(getNodesInfoCmd)
+		if err != nil {
+			errInfo := &errdetails.ErrorInfo{
+				Reason: "COMMAND_EXEC_FAILED",
 			}
+			st := status.New(codes.Internal, "Exec command failed or slurmctld down.")
+			st, _ = st.WithDetails(errInfo)
+			logger.Errorf("GetClusterNodesInfo failed: %v", st.Err())
+			return nil, st.Err()
 		}
-		name := fields["NodeName"]
-		if !nodeIdentifier.MatchString(name) || seen[name] || (len(expected) > 0 && !expected[name]) {
-			return nil, status.Error(codes.Internal, "Unexpected Slurm node record")
+		// 按行分割输出
+		scanner := bufio.NewScanner(strings.NewReader(output))
+		for scanner.Scan() {
+			line := scanner.Text()
+			nodeInfo := extractNodeInfo(line)
+			nodesInfo = append(nodesInfo, nodeInfo)
 		}
-		seen[name] = true
-		node := extractNodeInfo(line)
-		node.NodeName = name
-		node.NodeAddr = fields["NodeAddr"]
-		node.NodeHostname = fields["NodeHostName"]
-		// Missing address fields retain resource-dashboard compatibility; proxy clients fail closed.
-		if node.NodeAddr != "" && net.ParseIP(node.NodeAddr) == nil && !nodeIdentifier.MatchString(node.NodeAddr) {
-			return nil, status.Error(codes.Internal, "Invalid Slurm node address")
-		}
-		if node.NodeHostname != "" && !nodeIdentifier.MatchString(node.NodeHostname) {
-			return nil, status.Error(codes.Internal, "Invalid Slurm node address")
-		}
-		nodes = append(nodes, node)
-		if len(nodes) > 4096 {
-			return nil, status.Error(codes.ResourceExhausted, "Too many node records")
-		}
+		logger.Tracef("GetClusterNodesInfoResponse: %v", nodesInfo)
+		return &pb.GetClusterNodesInfoResponse{Nodes: nodesInfo}, nil
 	}
-	if scanner.Err() != nil || (len(expected) > 0 && len(seen) != len(expected)) {
-		return nil, status.Error(codes.Internal, "Incomplete Slurm node records")
+
+	for _, node := range in.NodeNames {
+		nodeName := node
+		wg.Add(1)
+		go func() {
+			getNodeInfo(nodeName, &wg, chan<- *pb.NodeInfo(nodeChan), chan<- error(errChan))
+		}()
 	}
-	return &pb.GetClusterNodesInfoResponse{Nodes: nodes}, nil
+
+	go func() {
+		wg.Wait()
+		close(nodeChan)
+		close(errChan)
+	}()
+
+	for nodeInfo := range nodeChan {
+		nodesInfo = append(nodesInfo, nodeInfo)
+	}
+
+	select {
+	case err := <-errChan:
+		if err != nil {
+			logger.Errorf("GetClusterNodesInfo failed: %v", err)
+			return nil, err
+		}
+	default:
+	}
+	logger.Tracef("GetClusterNodesInfoResponse: %v", nodesInfo)
+	return &pb.GetClusterNodesInfoResponse{Nodes: nodesInfo}, nil
 }
 
 // job service
