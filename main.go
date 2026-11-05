@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"errors"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 
 	"fmt"
 	"math"
@@ -18,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	pb "scow-slurm-adapter/gen/go"
 
@@ -705,91 +709,148 @@ func (s *serverUser) QueryUserInAccountBlockStatus(ctx context.Context, in *pb.Q
 	return &pb.QueryUserInAccountBlockStatusResponse{Blocked: true}, nil
 }
 
-func (s *serverUser) DeleteUser(ctx context.Context, in *pb.DeleteUserRequest) (*pb.DeleteUserResponse, error) {
+// These guards deliberately match the captured-home checks formerly run by MIS.
+const userHomeDirectoryChecks = `
+test -d "$home"
+test ! -L "$home"
+p=$home
+while test "$p" != /; do
+  test ! -L "$p"
+  if test "$p" != "$home"; then
+    test "$(stat -c %u -- "$p")" = 0
+    mode=$(stat -c %a -- "$p")
+    test "$((0$mode & 0022))" = 0
+  fi
+  p=$(dirname -- "$p")
+done
+test "$(readlink -e -- "$home")" = "$home"
+`
+
+var deletionUsernamePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_.-]*\$?$`)
+
+func (s *serverUser) DeleteUserHome(ctx context.Context, in *pb.DeleteUserHomeRequest) (*pb.DeleteUserHomeResponse, error) {
+	userID, homePath, homeIdentity := in.UserId, in.HomePath, in.HomeIdentity
+	validIdentity := regexp.MustCompile(`^[0-9]+:[0-9]+:[0-9]+$`).MatchString(homeIdentity)
+	parts := strings.Split(homePath, "/")
+	if userID == "root" || !deletionUsernamePattern.MatchString(userID) || !validIdentity || !filepath.IsAbs(homePath) || len(parts) < 3 {
+		return nil, status.Error(codes.InvalidArgument, "Unsafe captured home target.")
+	}
+	uid, err := strconv.ParseUint(strings.Split(homeIdentity, ":")[2], 10, 32)
+	if err != nil || uid == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Home cleanup requires a captured non-root UID.")
+	}
+	for _, part := range parts[1:] {
+		if part == "" || part == "." || part == ".." || strings.ContainsFunc(part, unicode.IsControl) {
+			return nil, status.Error(codes.InvalidArgument, "Unsafe captured home path.")
+		}
+	}
+	switch parts[1] {
+	case "bin", "boot", "dev", "etc", "lib", "lib64", "proc", "root", "run", "sbin", "sys", "tmp", "usr", "lost+found":
+		return nil, status.Error(codes.InvalidArgument, "System directory cannot be a home cleanup target.")
+	}
+	script := `set -eu
+home=$1
+for cmd in stat dirname readlink rm; do command -v "$cmd" >/dev/null; done
+` + userHomeDirectoryChecks + `
+test "$(stat -c '%d:%i:%u' -- "$home")" = "$2"
+if command -v rsync >/dev/null; then
+for cmd in mkdir rmdir; do command -v "$cmd" >/dev/null; done
+test -d /tmp
+test ! -L /tmp
+test "$(stat -c %u -- /tmp)" = 0
+tmpmode=$(stat -c %a -- /tmp)
+test "$((0$tmpmode & 01000))" != 0
+test ! -e "$3"
+test ! -L "$3"
+mkdir -m 0700 -- "$3"
+test ! -L "$3"
+test "$(stat -c '%u:%a' -- "$3")" = 0:700
+rsync -a --delete -- "$3/" "$home/"
+` + userHomeDirectoryChecks + `
+# Archive copies the root source UID; retain device/inode verification after rsync.
+test "$(stat -c '%d:%i' -- "$home")" = "${2%:*}"
+fi
+rm -rf -- "$home"
+if command -v rsync >/dev/null; then rmdir -- "$3"; fi
+`
+	output, err := exec.CommandContext(ctx, "sh", "-c", script, "--", homePath, homeIdentity, "/tmp/del-"+userID).CombinedOutput()
+	if err != nil {
+		logger.WithFields(logrus.Fields{"userId": userID, "homePath": homePath, "homeIdentity": homeIdentity, "error": err, "output": string(output)}).Error("Captured home cleanup failed; retain target for manual recovery")
+		return nil, status.Error(codes.FailedPrecondition, "Captured home cleanup failed; use the captured target for manual recovery without resolving the deleted identity.")
+	}
+	logger.WithFields(logrus.Fields{"userId": userID, "homePath": homePath, "homeIdentity": homeIdentity}).Info("Captured home cleanup completed")
+	return &pb.DeleteUserHomeResponse{HomeIdentity: homeIdentity}, nil
+}
+
+func (s *serverUser) DeleteUserInSlurm(ctx context.Context, in *pb.DeleteUserInSlurmRequest) (*pb.DeleteUserInSlurmResponse, error) {
+	if !deletionUsernamePattern.MatchString(in.UserId) {
+		return nil, status.Error(codes.InvalidArgument, "The username contains illegal characters.")
+	}
 	// 检查用户是不是存在
 	var (
 		userName string
 	)
 	userSqlConfig := "SELECT name FROM user_table WHERE name = ? AND deleted = 0"
-	err := db.QueryRow(userSqlConfig, in.UserId).Scan(&userName)
-	if err != nil {
+	err := db.QueryRowContext(ctx, userSqlConfig, in.UserId).Scan(&userName)
+	userAbsent := errors.Is(err, sql.ErrNoRows)
+	if err != nil && !userAbsent {
 		errInfo := &errdetails.ErrorInfo{
-			Reason: "USER_NOT_FOUND",
+			Reason: "SQL_QUERY_FAILED",
 		}
-		message := fmt.Sprintf("%s does not exists.", in.UserId)
-		st := status.New(codes.NotFound, message)
+		st := status.New(codes.Internal, "Failed to query Slurm user.")
 		st, _ = st.WithDetails(errInfo)
 		logger.Warnf("DeleteUser failed: %v", st.Err())
-		// return nil, st.Err()
+		return nil, st.Err()
 	}
 
 	// 作业的判断
-	userRunningJobInfoCmd := fmt.Sprintf("squeue --noheader -u %s", in.UserId)
-	runningJobInfo, err := utils.RunCommand(userRunningJobInfoCmd)
+	// Query owner names without a user filter so retries also work after NSS removal.
+	runningJobInfo, err := exec.CommandContext(ctx, "squeue", "--noheader", "--format=%u").Output()
 
 	if err != nil {
 		errInfo := &errdetails.ErrorInfo{
 			Reason: "CMD_EXECUTE_FAILED",
 		}
-		st := status.New(codes.NotFound, err.Error())
+		st := status.New(codes.Internal, fmt.Sprintf("squeue failed: %v", err))
 		st, _ = st.WithDetails(errInfo)
 		logger.Warnf("DeleteUser failed: %v", st.Err())
-		// return nil, st.Err()
+		return nil, st.Err()
 	}
 
-	if len(runningJobInfo) > 0 {
-		cancelJobCmd := fmt.Sprintf("scancel -u %s", in.UserId)
-		_, err := utils.RunCommand(cancelJobCmd)
+	for _, owner := range strings.Fields(string(runningJobInfo)) {
+		if owner != in.UserId {
+			continue
+		}
+		_, err := exec.CommandContext(ctx, "scancel", "--user="+in.UserId).Output()
 		if err != nil {
 			errInfo := &errdetails.ErrorInfo{
 				Reason: "CMD_EXECUTE_FAILED",
 			}
-			st := status.New(codes.NotFound, err.Error())
+			st := status.New(codes.Internal, fmt.Sprintf("scancel failed: %v", err))
 			st, _ = st.WithDetails(errInfo)
 			logger.Warnf("DeleteUser failed: %v", st.Err())
-			// return nil, st.Err()
+			return nil, st.Err()
 		}
+		break
 	}
 
-	deleteUserCmd := fmt.Sprintf("sacctmgr -i delete user name=%s", in.UserId)
-	_, err = utils.RunCommand(deleteUserCmd)
-	if err != nil {
-		errInfo := &errdetails.ErrorInfo{
-			Reason: "CMD_EXECUTE_FAILED",
-		}
-		st := status.New(codes.NotFound, err.Error())
-		st, _ = st.WithDetails(errInfo)
-		logger.Warnf("DeleteUser failed: %v", st.Err())
-		// return nil, st.Err()
-	}
-
-	logger.Infof("DeleteHomeDir: %t", in.DeleteHomeDir)
-	if in.DeleteHomeDir {
-		// 获取用户家目录
-		getHomeDirCmd := fmt.Sprintf("eval echo ~%s", in.UserId)
-		homeDir, err := utils.RunCommand(getHomeDirCmd)
+	if !userAbsent {
+		_, err = exec.CommandContext(ctx, "sacctmgr", "-i", "delete", "user", "name="+in.UserId).Output()
 		if err != nil {
-			// 如果获取家目录失败，记录日志但不中断流程
-			logger.Warnf("Failed to get home directory for user %s: %v", in.UserId, err)
-		} else if homeDir != "" {
-			// 清理可能存在的换行符
-			homeDir = strings.TrimSpace(homeDir)
-
-			deleteHomeDirCmd := fmt.Sprintf("rm -rf %s", homeDir)
-			_, err = utils.RunCommand(deleteHomeDirCmd)
-			if err != nil {
-				logger.Warnf("Failed to delete home directory %s for user %s: %v",
-					homeDir, in.UserId, err)
-				// 这里只是警告，不返回错误，因为用户已经从slurm删除了
-			} else {
-				logger.Infof("Deleted home directory: %s for user: %s", homeDir, in.UserId)
+			errInfo := &errdetails.ErrorInfo{
+				Reason: "CMD_EXECUTE_FAILED",
 			}
+			st := status.New(codes.Internal, fmt.Sprintf("sacctmgr failed: %v", err))
+			st, _ = st.WithDetails(errInfo)
+			logger.Warnf("DeleteUser failed: %v", st.Err())
+			return nil, st.Err()
 		}
 	}
+
 	logger.Infof("Delete User: %v sucess!", in.UserId)
 	// 执行成功直接返回
 
-	return &pb.DeleteUserResponse{}, nil
+	return &pb.DeleteUserInSlurmResponse{}, nil
 
 }
 
@@ -1424,7 +1485,14 @@ func (s *serverAccount) DeleteAccount(ctx context.Context, in *pb.DeleteAccountR
 	)
 	// 检查账户名是否在slurm中
 	acctSqlConfig := "SELECT name FROM acct_table WHERE name = ? AND deleted = 0"
-	err := db.QueryRow(acctSqlConfig, in.AccountName).Scan(&acctName)
+	err := db.QueryRowContext(ctx, acctSqlConfig, in.AccountName).Scan(&acctName)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		errInfo := &errdetails.ErrorInfo{Reason: "SQL_QUERY_FAILED"}
+		st := status.New(codes.Internal, "Failed to query Slurm account.")
+		st, _ = st.WithDetails(errInfo)
+		logger.Errorf("DeleteAccount failed: %v", st.Err())
+		return nil, st.Err()
+	}
 	if err != nil {
 		errInfo := &errdetails.ErrorInfo{
 			Reason: "ACCOUNT_NOT_FOUND",
@@ -1442,7 +1510,7 @@ func (s *serverAccount) DeleteAccount(ctx context.Context, in *pb.DeleteAccountR
 		errInfo := &errdetails.ErrorInfo{
 			Reason: "CMD_EXECUTE_FAILED",
 		}
-		st := status.New(codes.NotFound, err.Error())
+		st := status.New(codes.Internal, err.Error())
 		st, _ = st.WithDetails(errInfo)
 		logger.Errorf("DeleteAccount failed: %v", st.Err())
 		return nil, st.Err()
@@ -1481,12 +1549,15 @@ func (s *serverAccount) DeleteAccount(ctx context.Context, in *pb.DeleteAccountR
 				deleteUserCmd := fmt.Sprintf("sacctmgr -i delete user %s account=%s", user, in.AccountName)
 				_, err := utils.RunCommand(deleteUserCmd)
 				if err != nil {
-					// 注意：这里可能希望继续删除其他用户，即使某个用户删除失败
 					logger.Warningf("Failed to delete user %s from account %s: %v. Try delete by defaultaccount", user, in.AccountName, err)
 					deleteUserCmd := fmt.Sprintf("sacctmgr -i delete user %s defaultaccount=%s", user, in.AccountName)
 					_, err := utils.RunCommand(deleteUserCmd)
 					if err != nil {
 						logger.Errorf("Failed to delete user %s from defaultaccount %s: %v", user, in.AccountName, err)
+						errInfo := &errdetails.ErrorInfo{Reason: "CMD_EXECUTE_FAILED"}
+						st := status.New(codes.Internal, "Failed to delete user association from account.")
+						st, _ = st.WithDetails(errInfo)
+						return nil, st.Err()
 					} else {
 						logger.Infof("Successfully deleted user %s from account %s", user, in.AccountName)
 					}
@@ -1504,7 +1575,7 @@ func (s *serverAccount) DeleteAccount(ctx context.Context, in *pb.DeleteAccountR
 			errInfo := &errdetails.ErrorInfo{
 				Reason: "CMD_EXECUTE_FAILED",
 			}
-			st := status.New(codes.NotFound, err.Error())
+			st := status.New(codes.Internal, err.Error())
 			st, _ = st.WithDetails(errInfo)
 			logger.Errorf("DeleteAccount failed: %v", st.Err())
 			return nil, st.Err()
@@ -1515,7 +1586,7 @@ func (s *serverAccount) DeleteAccount(ctx context.Context, in *pb.DeleteAccountR
 		errInfo := &errdetails.ErrorInfo{
 			Reason: "HAVE_RUNNING_JOBS",
 		}
-		st := status.New(codes.NotFound, "Exist running jobs.")
+		st := status.New(codes.FailedPrecondition, "Exist running jobs.")
 		st, _ = st.WithDetails(errInfo)
 		logger.Errorf("DeleteAccount failed: %v", st.Err())
 		return nil, st.Err()
