@@ -2438,7 +2438,7 @@ func getClusterInfoTotals() (clusterInfoTotals, error) {
 	if utils.CheckSlurmStatus(sinfoOutput) {
 		return clusterInfoTotals{}, fmt.Errorf("failed to query cluster resources: %s", sinfoOutput)
 	}
-	squeueOutput, err := utils.RunCommand("squeue -h -r -t R,PD -o '%i|%T|%b|%D'")
+	squeueOutput, err := utils.RunCommand("squeue -h -t R,PD -o '%i|%T|%b|%D'")
 	if err != nil {
 		return clusterInfoTotals{}, fmt.Errorf("failed to query cluster jobs: %w", err)
 	}
